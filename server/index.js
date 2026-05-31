@@ -1,0 +1,1150 @@
+import { Buffer } from 'node:buffer'
+import cookieParser from 'cookie-parser'
+import Database from 'better-sqlite3'
+import crypto from 'node:crypto'
+import fs from 'node:fs'
+import path from 'node:path'
+import process from 'node:process'
+import express from 'express'
+import { rateLimit } from 'express-rate-limit'
+import { fileURLToPath } from 'node:url'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+const projectRoot = path.resolve(__dirname, '..')
+const dataDirectory = path.join(projectRoot, 'data')
+const dbPath = process.env.DATABASE_FILE
+  ? path.resolve(projectRoot, process.env.DATABASE_FILE)
+  : path.join(dataDirectory, 'guild-bank.db')
+const backupsDirectory = path.join(path.dirname(dbPath), 'backups')
+const port = Number(process.env.PORT) || 3001
+const sessionCookieName = process.env.SESSION_COOKIE_NAME || 'eso_guild_bank_session'
+const sessionTtlDays = Number(process.env.SESSION_TTL_DAYS) || 14
+const sessionTtlMs = sessionTtlDays * 24 * 60 * 60 * 1000
+const backupRetentionCount = Number(process.env.BACKUP_RETENTION_COUNT) || 20
+const backupMinIntervalMs = Number(process.env.BACKUP_MIN_INTERVAL_MS) || 5 * 60 * 1000
+const isProduction = process.env.NODE_ENV === 'production'
+const entryTypes = new Set(['deposit', 'withdrawal', 'salesTax'])
+
+fs.mkdirSync(path.dirname(dbPath), { recursive: true })
+fs.mkdirSync(backupsDirectory, { recursive: true })
+
+const db = new Database(dbPath)
+db.pragma('foreign_keys = ON')
+db.pragma('journal_mode = WAL')
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    password_salt TEXT NOT NULL,
+    selected_guild_id TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS guilds (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    week_start_date TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS entries (
+    id TEXT PRIMARY KEY,
+    guild_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    amount INTEGER NOT NULL,
+    date TEXT NOT NULL,
+    user_name TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (guild_id) REFERENCES guilds (id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS guild_members (
+    guild_id TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (guild_id, user_id),
+    FOREIGN KEY (guild_id) REFERENCES guilds (id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS guild_invites (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL,
+    code_hash TEXT NOT NULL UNIQUE,
+    created_by_user_id INTEGER NOT NULL,
+    single_use INTEGER NOT NULL DEFAULT 1,
+    expires_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (guild_id) REFERENCES guilds (id) ON DELETE CASCADE,
+    FOREIGN KEY (created_by_user_id) REFERENCES users (id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS audit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor_user_id INTEGER,
+    action TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT,
+    details TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (actor_user_id) REFERENCES users (id) ON DELETE SET NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_sessions_token_hash ON sessions (token_hash);
+  CREATE INDEX IF NOT EXISTS idx_guilds_user_id ON guilds (user_id);
+  CREATE INDEX IF NOT EXISTS idx_entries_guild_id ON entries (guild_id);
+  CREATE INDEX IF NOT EXISTS idx_guild_members_user_id ON guild_members (user_id);
+  CREATE INDEX IF NOT EXISTS idx_guild_invites_guild_id ON guild_invites (guild_id);
+  CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs (created_at);
+`)
+
+db.prepare(
+  `INSERT OR IGNORE INTO guild_members (guild_id, user_id)
+   SELECT id, user_id FROM guilds`,
+).run()
+
+const guildInviteColumns = db.prepare('PRAGMA table_info(guild_invites)').all()
+if (!guildInviteColumns.some((column) => column.name === 'single_use')) {
+  db.exec('ALTER TABLE guild_invites ADD COLUMN single_use INTEGER NOT NULL DEFAULT 1')
+}
+if (!guildInviteColumns.some((column) => column.name === 'expires_at')) {
+  db.exec('ALTER TABLE guild_invites ADD COLUMN expires_at TEXT')
+}
+
+db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(new Date().toISOString())
+
+const statements = {
+  createUser: db.prepare(
+    `INSERT INTO users (username, password_hash, password_salt, selected_guild_id)
+     VALUES (@username, @passwordHash, @passwordSalt, NULL)`,
+  ),
+  findUserByUsername: db.prepare('SELECT * FROM users WHERE username = ?'),
+  findUserById: db.prepare('SELECT * FROM users WHERE id = ?'),
+  deleteUserById: db.prepare('DELETE FROM users WHERE id = ?'),
+  updateUserSelectedGuild: db.prepare('UPDATE users SET selected_guild_id = ? WHERE id = ?'),
+  createSession: db.prepare(
+    `INSERT INTO sessions (user_id, token_hash, expires_at)
+     VALUES (@userId, @tokenHash, @expiresAt)`,
+  ),
+  findSessionUserByTokenHash: db.prepare(
+    `SELECT sessions.token_hash, sessions.expires_at, users.*
+     FROM sessions
+     JOIN users ON users.id = sessions.user_id
+     WHERE sessions.token_hash = ? AND sessions.expires_at > ?`,
+  ),
+  deleteSessionByTokenHash: db.prepare('DELETE FROM sessions WHERE token_hash = ?'),
+  deleteExpiredSessions: db.prepare('DELETE FROM sessions WHERE expires_at <= ?'),
+  listGuildsForUser: db.prepare(
+    `SELECT guilds.id,
+            guilds.name,
+            guilds.week_start_date AS weekStartDate,
+            guilds.created_at AS createdAt,
+            guilds.user_id AS ownerUserId,
+            owners.username AS ownerUsername
+     FROM guilds
+     JOIN guild_members ON guild_members.guild_id = guilds.id
+     JOIN users AS owners ON owners.id = guilds.user_id
+     WHERE guild_members.user_id = ?
+     ORDER BY guilds.created_at ASC, guilds.id ASC`,
+  ),
+  findFirstGuildForUser: db.prepare(
+    `SELECT guilds.id
+     FROM guilds
+     JOIN guild_members ON guild_members.guild_id = guilds.id
+     WHERE guild_members.user_id = ?
+     ORDER BY guilds.created_at ASC, guilds.id ASC
+     LIMIT 1`,
+  ),
+  listEntriesForGuild: db.prepare(
+    `SELECT id, type, amount, date, user_name AS user, notes, created_at AS createdAt
+     FROM entries
+     WHERE guild_id = ?
+     ORDER BY date DESC, created_at DESC, id DESC`,
+  ),
+  listGuildMembersForGuild: db.prepare(
+    `SELECT users.id AS userId,
+            users.username,
+            CASE WHEN users.id = guilds.user_id THEN 1 ELSE 0 END AS isOwner
+     FROM guild_members
+     JOIN users ON users.id = guild_members.user_id
+     JOIN guilds ON guilds.id = guild_members.guild_id
+     WHERE guild_members.guild_id = ?
+     ORDER BY isOwner DESC, users.username ASC`,
+  ),
+  findGuildForUser: db.prepare(
+    `SELECT guilds.id,
+            guilds.user_id AS ownerUserId,
+            guilds.name,
+            guilds.week_start_date AS weekStartDate
+     FROM guilds
+     JOIN guild_members ON guild_members.guild_id = guilds.id
+     WHERE guilds.id = ? AND guild_members.user_id = ?`,
+  ),
+  createGuild: db.prepare(
+    `INSERT INTO guilds (id, user_id, name, week_start_date)
+     VALUES (@id, @userId, @name, @weekStartDate)`,
+  ),
+  createGuildMember: db.prepare(
+    `INSERT OR IGNORE INTO guild_members (guild_id, user_id)
+     VALUES (?, ?)`,
+  ),
+  findGuildMember: db.prepare(
+    `SELECT guild_id AS guildId, user_id AS userId
+     FROM guild_members
+     WHERE guild_id = ? AND user_id = ?`,
+  ),
+  deleteGuildMember: db.prepare(
+    `DELETE FROM guild_members
+     WHERE guild_id = ? AND user_id = ?`,
+  ),
+  renameGuild: db.prepare('UPDATE guilds SET name = ? WHERE id = ? AND user_id = ?'),
+  updateGuildWeekStartDate: db.prepare(
+    'UPDATE guilds SET week_start_date = ? WHERE id = ? AND user_id = ?',
+  ),
+  deleteGuild: db.prepare('DELETE FROM guilds WHERE id = ? AND user_id = ?'),
+  createGuildInvite: db.prepare(
+    `INSERT INTO guild_invites (guild_id, code_hash, created_by_user_id, single_use, expires_at)
+     VALUES (@guildId, @codeHash, @createdByUserId, @singleUse, @expiresAt)`,
+  ),
+  findGuildInviteByCodeHash: db.prepare(
+    `SELECT guild_invites.id,
+            guild_invites.guild_id AS guildId,
+            guilds.user_id AS ownerUserId,
+            guild_invites.single_use AS singleUse,
+            guild_invites.expires_at AS expiresAt
+     FROM guild_invites
+     JOIN guilds ON guilds.id = guild_invites.guild_id
+     WHERE guild_invites.code_hash = ?
+       AND (guild_invites.expires_at IS NULL OR guild_invites.expires_at > ?)`,
+  ),
+  deleteGuildInviteById: db.prepare('DELETE FROM guild_invites WHERE id = ?'),
+  deleteExpiredGuildInvites: db.prepare(
+    'DELETE FROM guild_invites WHERE expires_at IS NOT NULL AND expires_at <= ?',
+  ),
+  createAuditLog: db.prepare(
+    `INSERT INTO audit_logs (actor_user_id, action, entity_type, entity_id, details)
+     VALUES (@actorUserId, @action, @entityType, @entityId, @details)`,
+  ),
+  createEntry: db.prepare(
+    `INSERT INTO entries (id, guild_id, type, amount, date, user_name, notes)
+     VALUES (@id, @guildId, @type, @amount, @date, @user, @notes)`,
+  ),
+  findEntryForGuild: db.prepare(
+    `SELECT id, guild_id AS guildId, type, amount, date, user_name AS user, notes
+     FROM entries
+     WHERE id = ? AND guild_id = ?`,
+  ),
+  updateEntry: db.prepare(
+    `UPDATE entries
+     SET type = @type,
+         amount = @amount,
+         date = @date,
+         user_name = @user,
+         notes = @notes
+     WHERE id = @id AND guild_id = @guildId`,
+  ),
+  deleteEntry: db.prepare('DELETE FROM entries WHERE id = ? AND guild_id = ?'),
+}
+
+const app = express()
+
+app.disable('x-powered-by')
+app.use(express.json({ limit: '1mb' }))
+app.use(cookieParser())
+
+function createHttpError(status, message) {
+  const error = new Error(message)
+  error.status = status
+  return error
+}
+
+function isSafeHttpMethod(method) {
+  return ['GET', 'HEAD', 'OPTIONS'].includes(String(method || '').toUpperCase())
+}
+
+function getExpectedOrigin(request) {
+  return `${request.protocol}://${request.get('host')}`
+}
+
+function isLoopbackHostname(hostname) {
+  return ['localhost', '127.0.0.1', '[::1]', '::1'].includes(String(hostname || '').toLowerCase())
+}
+
+function hasTrustedOriginMatch(originValue, expectedOrigin) {
+  if (originValue === expectedOrigin) {
+    return true
+  }
+
+  try {
+    const parsedOrigin = new URL(originValue)
+    const parsedExpectedOrigin = new URL(expectedOrigin)
+
+    if (
+      !isProduction &&
+      parsedOrigin.protocol === parsedExpectedOrigin.protocol &&
+      isLoopbackHostname(parsedOrigin.hostname) &&
+      isLoopbackHostname(parsedExpectedOrigin.hostname)
+    ) {
+      return true
+    }
+  } catch {
+    return false
+  }
+
+  return false
+}
+
+function hasTrustedRequestOrigin(request) {
+  const expectedOrigin = getExpectedOrigin(request)
+  const origin = request.get('origin')
+  const referer = request.get('referer')
+  const fetchSite = request.get('sec-fetch-site')
+
+  if (origin) {
+    return hasTrustedOriginMatch(origin, expectedOrigin)
+  }
+
+  if (referer) {
+    return hasTrustedOriginMatch(referer, expectedOrigin) || referer.startsWith(`${expectedOrigin}/`)
+  }
+
+  return fetchSite === 'same-origin' || fetchSite === 'same-site' || !fetchSite
+}
+
+const apiRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 300,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  handler: (_request, _response, next) => {
+    next(createHttpError(429, 'Too many requests were sent in a short time. Please wait a moment and try again.'))
+  },
+})
+
+const authRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  handler: (_request, _response, next) => {
+    next(createHttpError(429, 'Too many sign-in or account creation attempts were made. Please wait a few minutes and try again.'))
+  },
+})
+
+function requireBasicCsrfProtection(request, _response, next) {
+  if (!request.path.startsWith('/api') || isSafeHttpMethod(request.method)) {
+    next()
+    return
+  }
+
+  if (request.get('x-requested-with') !== 'XMLHttpRequest') {
+    next(createHttpError(403, 'This request is missing a required security header. Refresh the page and try again.'))
+    return
+  }
+
+  if (!hasTrustedRequestOrigin(request)) {
+    next(createHttpError(403, 'This request came from an untrusted origin. Open the app directly and try again.'))
+    return
+  }
+
+  next()
+}
+
+app.use('/api/auth', authRateLimiter)
+app.use('/api', apiRateLimiter)
+app.use(requireBasicCsrfProtection)
+
+let backupScheduled = false
+let backupPromise = Promise.resolve()
+let lastBackupAt = 0
+let pendingBackupReason = 'mutation'
+
+function normalizeUsername(value) {
+  return String(value || '').trim().toLowerCase()
+}
+
+function sanitizeBackupReason(reason) {
+  return String(reason || 'mutation')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'mutation'
+}
+
+function writeAuditLog({ actorUserId = null, action, entityType, entityId = null, details = {} }) {
+  statements.createAuditLog.run({
+    actorUserId,
+    action,
+    entityType,
+    entityId: entityId == null ? null : String(entityId),
+    details: JSON.stringify(details),
+  })
+}
+
+function pruneOldBackups() {
+  const backupFiles = fs
+    .readdirSync(backupsDirectory, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.db'))
+    .map((entry) => entry.name)
+    .sort()
+
+  while (backupFiles.length > backupRetentionCount) {
+    const oldestBackup = backupFiles.shift()
+    fs.rmSync(path.join(backupsDirectory, oldestBackup), { force: true })
+  }
+}
+
+function scheduleBackup(reason) {
+  pendingBackupReason = sanitizeBackupReason(reason)
+  if (backupScheduled) {
+    return
+  }
+
+  backupScheduled = true
+  const delay = Math.max(0, backupMinIntervalMs - (Date.now() - lastBackupAt))
+
+  setTimeout(() => {
+    backupScheduled = false
+    const backupReason = pendingBackupReason
+
+    backupPromise = backupPromise
+      .catch(() => {})
+      .then(async () => {
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+        const backupFilePath = path.join(backupsDirectory, `${timestamp}-${backupReason}.db`)
+        await db.backup(backupFilePath)
+        lastBackupAt = Date.now()
+        pruneOldBackups()
+      })
+      .catch((error) => {
+        console.error('Database backup failed:', error)
+      })
+  }, delay)
+}
+
+function todayString() {
+  return new Date().toISOString().slice(0, 10)
+}
+
+function isValidIsoDate(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(value)
+}
+
+function sanitizeText(value, maxLength) {
+  return String(value || '').trim().slice(0, maxLength)
+}
+
+function validatePassword(password) {
+  if (typeof password !== 'string' || password.length < 10) {
+    throw createHttpError(400, 'Your password must be at least 10 characters long.')
+  }
+}
+
+function validateUsername(username) {
+  if (!/^[a-z0-9_-]{3,30}$/.test(username)) {
+    throw createHttpError(
+      400,
+      'Your username must be 3-30 characters and can only use lowercase letters, numbers, underscores, or hyphens.',
+    )
+  }
+}
+
+function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
+  const passwordHash = crypto.scryptSync(password, salt, 64).toString('hex')
+  return { passwordHash, passwordSalt: salt }
+}
+
+function verifyPassword(password, user) {
+  const suppliedHash = crypto.scryptSync(password, user.password_salt, 64)
+  const storedHash = Buffer.from(user.password_hash, 'hex')
+
+  return suppliedHash.length === storedHash.length && crypto.timingSafeEqual(suppliedHash, storedHash)
+}
+
+function hashSessionToken(token) {
+  return crypto.createHash('sha256').update(token).digest('hex')
+}
+
+function setSessionCookie(response, token, expiresAt) {
+  response.cookie(sessionCookieName, token, {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: isProduction,
+    expires: new Date(expiresAt),
+    path: '/',
+  })
+}
+
+function clearSessionCookie(response) {
+  response.clearCookie(sessionCookieName, {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: isProduction,
+    path: '/',
+  })
+}
+
+function sanitizeEntryPayload(payload) {
+  const type = String(payload?.type || '')
+  const amount = Math.round(Number(payload?.amount))
+  const date = String(payload?.date || '')
+  const user = sanitizeText(payload?.user, 80)
+  const notes = sanitizeText(payload?.notes, 500)
+
+  if (!entryTypes.has(type)) {
+    throw createHttpError(400, 'Choose a valid entry type before saving.')
+  }
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw createHttpError(400, 'Enter a gold amount greater than zero.')
+  }
+
+  if (!isValidIsoDate(date)) {
+    throw createHttpError(400, 'Choose a valid entry date in YYYY-MM-DD format.')
+  }
+
+  return { type, amount, date, user, notes }
+}
+
+function sanitizeGuildName(value) {
+  const name = sanitizeText(value, 80)
+  if (!name) {
+    throw createHttpError(400, 'Enter a guild name before continuing.')
+  }
+
+  return name
+}
+
+function sanitizeWeekStartDate(value) {
+  const weekStartDate = String(value || '') || todayString()
+  if (!isValidIsoDate(weekStartDate)) {
+    throw createHttpError(400, 'Choose a valid week start date in YYYY-MM-DD format.')
+  }
+
+  return weekStartDate
+}
+
+function normalizeInviteCode(value) {
+  return String(value || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '')
+}
+
+function createInviteCode() {
+  const raw = crypto.randomBytes(6).toString('hex').toUpperCase()
+  return raw.match(/.{1,4}/g).join('-')
+}
+
+function resolveInviteExpiry(expiresInHours) {
+  if (expiresInHours === null || typeof expiresInHours === 'undefined' || expiresInHours === '') {
+    return null
+  }
+
+  const parsedHours = Number(expiresInHours)
+  if (!Number.isFinite(parsedHours) || parsedHours <= 0) {
+    throw createHttpError(400, 'Choose a valid invite expiration time.')
+  }
+
+  return new Date(Date.now() + parsedHours * 60 * 60 * 1000).toISOString()
+}
+
+function ensureGuildForUser(userId, guildId) {
+  const guild = statements.findGuildForUser.get(guildId, userId)
+  if (!guild) {
+    throw createHttpError(404, 'That guild could not be found or you no longer have access to it.')
+  }
+
+  return guild
+}
+
+function ensureGuildOwner(userId, guildId) {
+  const guild = ensureGuildForUser(userId, guildId)
+  if (guild.ownerUserId !== userId) {
+    throw createHttpError(403, 'Only the guild owner can manage sharing and member access for this guild.')
+  }
+
+  return guild
+}
+
+function getFirstAccessibleGuildId(userId) {
+  return statements.findFirstGuildForUser.get(userId)?.id ?? null
+}
+
+function serializeUser(userId) {
+  const user = statements.findUserById.get(userId)
+  if (!user) {
+    return null
+  }
+
+  const guilds = statements.listGuildsForUser.all(userId).map((guild) => ({
+    ...guild,
+    isOwner: guild.ownerUserId === userId,
+    members: statements.listGuildMembersForGuild.all(guild.id).map((member) => ({
+      ...member,
+      isOwner: Boolean(member.isOwner),
+    })),
+    entries: statements.listEntriesForGuild.all(guild.id),
+  }))
+
+  const selectedGuildId = guilds.some((guild) => guild.id === user.selected_guild_id)
+    ? user.selected_guild_id
+    : guilds[0]?.id ?? null
+
+  if (selectedGuildId !== user.selected_guild_id) {
+    statements.updateUserSelectedGuild.run(selectedGuildId, userId)
+  }
+
+  return {
+    username: user.username,
+    selectedGuildId,
+    guilds,
+  }
+}
+
+function createSession(response, userId) {
+  const token = crypto.randomBytes(32).toString('hex')
+  const expiresAt = new Date(Date.now() + sessionTtlMs).toISOString()
+  statements.createSession.run({
+    userId,
+    tokenHash: hashSessionToken(token),
+    expiresAt,
+  })
+  setSessionCookie(response, token, expiresAt)
+}
+
+function getAuthenticatedUser(request) {
+  const token = request.cookies?.[sessionCookieName]
+  if (!token) {
+    return null
+  }
+
+  statements.deleteExpiredSessions.run(new Date().toISOString())
+  return statements.findSessionUserByTokenHash.get(hashSessionToken(token), new Date().toISOString())
+}
+
+function requireAuth(request, _response, next) {
+  const user = getAuthenticatedUser(request)
+  if (!user) {
+    next(createHttpError(401, 'Your session has expired or you are not signed in. Please log in and try again.'))
+    return
+  }
+
+  request.user = user
+  next()
+}
+
+app.get('/api/health', (_request, response) => {
+  response.json({ ok: true })
+})
+
+app.get('/api/session', (request, response) => {
+  const user = getAuthenticatedUser(request)
+  if (!user) {
+    clearSessionCookie(response)
+    response.json({ user: null })
+    return
+  }
+
+  response.json({ user: serializeUser(user.id) })
+})
+
+app.post('/api/auth/signup', (request, response, next) => {
+  try {
+    const username = normalizeUsername(request.body?.username)
+    const password = request.body?.password
+
+    validateUsername(username)
+    validatePassword(password)
+
+    if (statements.findUserByUsername.get(username)) {
+      throw createHttpError(409, 'That username is already in use. Choose a different username or log in instead.')
+    }
+
+    const { passwordHash, passwordSalt } = hashPassword(password)
+    const result = statements.createUser.run({
+      username,
+      passwordHash,
+      passwordSalt,
+    })
+    writeAuditLog({
+      actorUserId: result.lastInsertRowid,
+      action: 'auth.signup',
+      entityType: 'user',
+      entityId: result.lastInsertRowid,
+      details: { username },
+    })
+
+    createSession(response, result.lastInsertRowid)
+    scheduleBackup('auth-signup')
+    response.status(201).json({ user: serializeUser(result.lastInsertRowid) })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/auth/login', (request, response, next) => {
+  try {
+    const username = normalizeUsername(request.body?.username)
+    const password = request.body?.password
+
+    validateUsername(username)
+    validatePassword(password)
+
+    const user = statements.findUserByUsername.get(username)
+    if (!user || !verifyPassword(password, user)) {
+      throw createHttpError(401, 'The username or password you entered is incorrect.')
+    }
+
+    createSession(response, user.id)
+    response.json({ user: serializeUser(user.id) })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/auth/logout', (request, response) => {
+  const token = request.cookies?.[sessionCookieName]
+  if (token) {
+    statements.deleteSessionByTokenHash.run(hashSessionToken(token))
+  }
+
+  clearSessionCookie(response)
+  response.status(204).end()
+})
+
+app.delete('/api/account', requireAuth, (request, response, next) => {
+  try {
+    const password = request.body?.password
+
+    validatePassword(password)
+
+    const user = statements.findUserById.get(request.user.id)
+    if (!user || !verifyPassword(password, user)) {
+      throw createHttpError(401, 'The password you entered did not match your account. Account deletion was cancelled.')
+    }
+
+    const transaction = db.transaction(() => {
+      writeAuditLog({
+        actorUserId: request.user.id,
+        action: 'account.delete',
+        entityType: 'user',
+        entityId: request.user.id,
+        details: { username: user.username },
+      })
+      statements.deleteUserById.run(request.user.id)
+    })
+
+    transaction()
+    scheduleBackup('account-delete')
+    clearSessionCookie(response)
+    response.status(204).end()
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/guilds', requireAuth, (request, response, next) => {
+  try {
+    const name = sanitizeGuildName(request.body?.name)
+    const weekStartDate = sanitizeWeekStartDate(request.body?.weekStartDate || todayString())
+    const guildId = crypto.randomUUID()
+
+    const transaction = db.transaction(() => {
+      statements.createGuild.run({
+        id: guildId,
+        userId: request.user.id,
+        name,
+        weekStartDate,
+      })
+      statements.createGuildMember.run(guildId, request.user.id)
+      writeAuditLog({
+        actorUserId: request.user.id,
+        action: 'guild.create',
+        entityType: 'guild',
+        entityId: guildId,
+        details: { name, weekStartDate },
+      })
+
+      if (!request.user.selected_guild_id) {
+        statements.updateUserSelectedGuild.run(guildId, request.user.id)
+      }
+    })
+
+    transaction()
+    scheduleBackup('guild-create')
+    response.status(201).json({ user: serializeUser(request.user.id) })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/guilds/import-guest', requireAuth, (request, response, next) => {
+  try {
+    const name = sanitizeGuildName(request.body?.name || 'Imported Guest Guild')
+    const weekStartDate = sanitizeWeekStartDate(request.body?.weekStartDate || todayString())
+    const entries = Array.isArray(request.body?.entries) ? request.body.entries : []
+
+    const normalizedEntries = entries.map((entry) => ({
+      id: crypto.randomUUID(),
+      guildId: '',
+      ...sanitizeEntryPayload(entry),
+    }))
+
+    const guildId = crypto.randomUUID()
+    const transaction = db.transaction(() => {
+      statements.createGuild.run({
+        id: guildId,
+        userId: request.user.id,
+        name,
+        weekStartDate,
+      })
+      statements.createGuildMember.run(guildId, request.user.id)
+
+      for (const entry of normalizedEntries) {
+        statements.createEntry.run({ ...entry, guildId })
+      }
+
+      writeAuditLog({
+        actorUserId: request.user.id,
+        action: 'guild.import_guest',
+        entityType: 'guild',
+        entityId: guildId,
+        details: { name, weekStartDate, entryCount: normalizedEntries.length },
+      })
+
+      statements.updateUserSelectedGuild.run(guildId, request.user.id)
+    })
+
+    transaction()
+    scheduleBackup('guild-import')
+    response.status(201).json({ user: serializeUser(request.user.id) })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.patch('/api/guilds/:guildId', requireAuth, (request, response, next) => {
+  try {
+    const guild = ensureGuildOwner(request.user.id, request.params.guildId)
+    const updates = []
+
+    if (typeof request.body?.name !== 'undefined') {
+      const name = sanitizeGuildName(request.body.name)
+      statements.renameGuild.run(name, guild.id, request.user.id)
+      updates.push('name')
+    }
+
+    if (typeof request.body?.weekStartDate !== 'undefined') {
+      const weekStartDate = sanitizeWeekStartDate(request.body.weekStartDate)
+      statements.updateGuildWeekStartDate.run(weekStartDate, guild.id, request.user.id)
+      updates.push('weekStartDate')
+    }
+
+    if (updates.length === 0) {
+      throw createHttpError(400, 'No guild changes were submitted. Update the guild name or week start date and try again.')
+    }
+
+    writeAuditLog({
+      actorUserId: request.user.id,
+      action: 'guild.update',
+      entityType: 'guild',
+      entityId: guild.id,
+      details: { updates, body: request.body },
+    })
+
+    scheduleBackup('guild-update')
+    response.json({ user: serializeUser(request.user.id) })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/guilds/:guildId/select', requireAuth, (request, response, next) => {
+  try {
+    const guild = ensureGuildForUser(request.user.id, request.params.guildId)
+    statements.updateUserSelectedGuild.run(guild.id, request.user.id)
+    response.json({ user: serializeUser(request.user.id) })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.delete('/api/guilds/:guildId', requireAuth, (request, response, next) => {
+  try {
+    const guild = ensureGuildOwner(request.user.id, request.params.guildId)
+
+    const transaction = db.transaction(() => {
+      writeAuditLog({
+        actorUserId: request.user.id,
+        action: 'guild.delete',
+        entityType: 'guild',
+        entityId: guild.id,
+        details: { name: guild.name },
+      })
+      statements.deleteGuild.run(guild.id, request.user.id)
+      if (request.user.selected_guild_id === guild.id) {
+        statements.updateUserSelectedGuild.run(getFirstAccessibleGuildId(request.user.id), request.user.id)
+      }
+    })
+
+    transaction()
+    scheduleBackup('guild-delete')
+    response.json({ user: serializeUser(request.user.id) })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.delete('/api/guilds/:guildId/membership', requireAuth, (request, response, next) => {
+  try {
+    const guild = ensureGuildForUser(request.user.id, request.params.guildId)
+
+    if (guild.ownerUserId === request.user.id) {
+      throw createHttpError(400, 'You are the owner of this guild. Owners cannot leave; delete the guild instead if you no longer want it.')
+    }
+
+    const transaction = db.transaction(() => {
+      writeAuditLog({
+        actorUserId: request.user.id,
+        action: 'guild.leave',
+        entityType: 'guild_member',
+        entityId: `${guild.id}:${request.user.id}`,
+        details: { guildId: guild.id },
+      })
+      statements.deleteGuildMember.run(guild.id, request.user.id)
+
+      if (request.user.selected_guild_id === guild.id) {
+        statements.updateUserSelectedGuild.run(getFirstAccessibleGuildId(request.user.id), request.user.id)
+      }
+    })
+
+    transaction()
+    scheduleBackup('guild-leave')
+    response.json({ user: serializeUser(request.user.id) })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/guilds/:guildId/invites', requireAuth, (request, response, next) => {
+  try {
+    const guild = ensureGuildOwner(request.user.id, request.params.guildId)
+    const code = createInviteCode()
+    const singleUse = request.body?.singleUse === false ? 0 : 1
+    const expiresAt = resolveInviteExpiry(request.body?.expiresInHours)
+    statements.deleteExpiredGuildInvites.run(new Date().toISOString())
+    statements.createGuildInvite.run({
+      guildId: guild.id,
+      codeHash: hashSessionToken(normalizeInviteCode(code)),
+      createdByUserId: request.user.id,
+      singleUse,
+      expiresAt,
+    })
+
+    writeAuditLog({
+      actorUserId: request.user.id,
+      action: 'guild.invite_create',
+      entityType: 'guild_invite',
+      entityId: guild.id,
+      details: { guildId: guild.id, singleUse: Boolean(singleUse), expiresAt },
+    })
+
+    scheduleBackup('guild-invite-create')
+    response.status(201).json({ code, singleUse: Boolean(singleUse), expiresAt })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/invites/redeem', requireAuth, (request, response, next) => {
+  try {
+    const normalizedCode = normalizeInviteCode(request.body?.code)
+    if (!normalizedCode) {
+      throw createHttpError(400, 'Enter an invite code before trying to join a shared guild.')
+    }
+
+    statements.deleteExpiredGuildInvites.run(new Date().toISOString())
+    const invite = statements.findGuildInviteByCodeHash.get(
+      hashSessionToken(normalizedCode),
+      new Date().toISOString(),
+    )
+    if (!invite) {
+      throw createHttpError(404, 'That invite code is not valid anymore. It may be incorrect, expired, or already used.')
+    }
+
+    const transaction = db.transaction(() => {
+      statements.createGuildMember.run(invite.guildId, request.user.id)
+      statements.updateUserSelectedGuild.run(invite.guildId, request.user.id)
+      writeAuditLog({
+        actorUserId: request.user.id,
+        action: 'guild.invite_redeem',
+        entityType: 'guild_member',
+        entityId: `${invite.guildId}:${request.user.id}`,
+        details: { guildId: invite.guildId, singleUse: Boolean(invite.singleUse) },
+      })
+      if (invite.singleUse) {
+        statements.deleteGuildInviteById.run(invite.id)
+      }
+    })
+
+    transaction()
+    scheduleBackup('guild-invite-redeem')
+    response.json({ user: serializeUser(request.user.id) })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.delete('/api/guilds/:guildId/members/:memberUserId', requireAuth, (request, response, next) => {
+  try {
+    const guild = ensureGuildOwner(request.user.id, request.params.guildId)
+    const memberUserId = Number(request.params.memberUserId)
+
+    if (!Number.isInteger(memberUserId)) {
+      throw createHttpError(400, 'The selected member could not be identified. Refresh the page and try again.')
+    }
+
+    if (memberUserId === guild.ownerUserId) {
+      throw createHttpError(400, 'The guild owner cannot be removed from the guild member list.')
+    }
+
+    if (!statements.findGuildMember.get(guild.id, memberUserId)) {
+      throw createHttpError(404, 'That guild member was not found. They may have already left or been removed.')
+    }
+
+    const transaction = db.transaction(() => {
+      writeAuditLog({
+        actorUserId: request.user.id,
+        action: 'guild.member_remove',
+        entityType: 'guild_member',
+        entityId: `${guild.id}:${memberUserId}`,
+        details: { guildId: guild.id, memberUserId },
+      })
+      statements.deleteGuildMember.run(guild.id, memberUserId)
+
+      const member = statements.findUserById.get(memberUserId)
+      if (member?.selected_guild_id === guild.id) {
+        statements.updateUserSelectedGuild.run(getFirstAccessibleGuildId(memberUserId), memberUserId)
+      }
+    })
+
+    transaction()
+    scheduleBackup('guild-member-remove')
+    response.json({ user: serializeUser(request.user.id) })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/guilds/:guildId/entries', requireAuth, (request, response, next) => {
+  try {
+    const guild = ensureGuildForUser(request.user.id, request.params.guildId)
+    const entry = sanitizeEntryPayload(request.body)
+
+    const entryId = crypto.randomUUID()
+    statements.createEntry.run({
+      id: entryId,
+      guildId: guild.id,
+      ...entry,
+    })
+
+    writeAuditLog({
+      actorUserId: request.user.id,
+      action: 'entry.create',
+      entityType: 'entry',
+      entityId: entryId,
+      details: { guildId: guild.id, type: entry.type, amount: entry.amount, date: entry.date },
+    })
+
+    scheduleBackup('entry-create')
+    response.status(201).json({ user: serializeUser(request.user.id) })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.patch('/api/guilds/:guildId/entries/:entryId', requireAuth, (request, response, next) => {
+  try {
+    const guild = ensureGuildForUser(request.user.id, request.params.guildId)
+    if (!statements.findEntryForGuild.get(request.params.entryId, guild.id)) {
+      throw createHttpError(404, 'That entry could not be found. It may have already been changed or deleted.')
+    }
+
+    const entry = sanitizeEntryPayload(request.body)
+    statements.updateEntry.run({
+      id: request.params.entryId,
+      guildId: guild.id,
+      ...entry,
+    })
+
+    writeAuditLog({
+      actorUserId: request.user.id,
+      action: 'entry.update',
+      entityType: 'entry',
+      entityId: request.params.entryId,
+      details: { guildId: guild.id, type: entry.type, amount: entry.amount, date: entry.date },
+    })
+
+    scheduleBackup('entry-update')
+    response.json({ user: serializeUser(request.user.id) })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.delete('/api/guilds/:guildId/entries/:entryId', requireAuth, (request, response, next) => {
+  try {
+    const guild = ensureGuildForUser(request.user.id, request.params.guildId)
+    if (!statements.findEntryForGuild.get(request.params.entryId, guild.id)) {
+      throw createHttpError(404, 'That entry could not be found. It may have already been changed or deleted.')
+    }
+
+    writeAuditLog({
+      actorUserId: request.user.id,
+      action: 'entry.delete',
+      entityType: 'entry',
+      entityId: request.params.entryId,
+      details: { guildId: guild.id },
+    })
+    statements.deleteEntry.run(request.params.entryId, guild.id)
+    scheduleBackup('entry-delete')
+    response.json({ user: serializeUser(request.user.id) })
+  } catch (error) {
+    next(error)
+  }
+})
+
+if (isProduction) {
+  const distDirectory = path.join(projectRoot, 'dist')
+  if (fs.existsSync(distDirectory)) {
+    app.use(express.static(distDirectory))
+    app.get(/^(?!\/api).*/, (_request, response) => {
+      response.sendFile(path.join(distDirectory, 'index.html'))
+    })
+  }
+}
+
+app.use((error, _request, response, _next) => {
+  const status = error.status || 500
+  const message = status >= 500 ? 'Internal server error.' : error.message
+  response.status(status).json({ error: message })
+})
+
+app.listen(port, () => {
+  console.log(`ESO Guild Bank API listening on http://localhost:${port}`)
+})

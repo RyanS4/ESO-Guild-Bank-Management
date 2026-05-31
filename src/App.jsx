@@ -12,15 +12,9 @@ import {
   DialogActions,
   DialogContent,
   DialogTitle,
-  Divider,
-  Drawer,
   FormControl,
   IconButton,
   InputLabel,
-  List,
-  ListItem,
-  ListItemButton,
-  ListItemText,
   MenuItem,
   Pagination,
   Select,
@@ -34,49 +28,104 @@ import {
   TextField,
   Toolbar,
   Typography,
-  createTheme,
   ThemeProvider,
+  createTheme,
 } from '@mui/material'
 import DeleteIcon from '@mui/icons-material/Delete'
 import EditIcon from '@mui/icons-material/Edit'
+import ExpandLessIcon from '@mui/icons-material/ExpandLess'
+import ExpandMoreIcon from '@mui/icons-material/ExpandMore'
+import SettingsIcon from '@mui/icons-material/Settings'
+import {
+  createEntryForGuild,
+  createGuildInvite,
+  createGuild,
+  deleteAccount,
+  deleteEntryFromGuild,
+  deleteGuild,
+  getSession,
+  importGuestGuild,
+  leaveGuild as leaveGuildRequest,
+  logIn,
+  logOut,
+  redeemGuildInvite,
+  removeGuildMember as removeGuildMemberRequest,
+  renameGuild,
+  selectGuild,
+  signUp,
+  updateEntryInGuild,
+} from './api'
+import AuthDialog from './components/AuthDialog'
+import DeleteAccountDialog from './components/DeleteAccountDialog'
+import GuildAccessDialog from './components/GuildAccessDialog'
+import GuildProfilesDrawer from './components/GuildProfilesDrawer'
+import SettingsDialog from './components/SettingsDialog'
 import './App.css'
 
-const STORAGE_KEY = 'eso-guild-bank-management-v1'
-const SESSION_USER_KEY = 'eso-guild-bank-session-user'
+const LEGACY_STORAGE_KEY = 'eso-guild-bank-management-v1'
+const LEGACY_SESSION_USER_KEY = 'eso-guild-bank-session-user'
 
 const todayString = () => new Date().toISOString().slice(0, 10)
 
-const createEmptyState = () => ({
-  guest: {
-    entries: [],
-    weekStartDate: todayString(),
-  },
-  users: {},
+const createGuestState = () => ({
+  entries: [],
+  weekStartDate: todayString(),
 })
 
-const parseStoredState = () => {
-  const raw = localStorage.getItem(STORAGE_KEY)
-  if (!raw) {
-    return createEmptyState()
-  }
+const normalizeEntry = (entry) => ({
+  ...entry,
+  user: entry?.user?.trim?.() ?? '',
+  notes: entry?.notes?.trim?.() ?? '',
+})
 
+const readLegacyState = () => {
   try {
+    const raw = window.localStorage.getItem(LEGACY_STORAGE_KEY)
+    if (!raw) {
+      return null
+    }
+
     const parsed = JSON.parse(raw)
+    const guestEntries = Array.isArray(parsed?.guest?.entries)
+      ? parsed.guest.entries.map(normalizeEntry)
+      : []
+    const users =
+      parsed?.users && typeof parsed.users === 'object'
+        ? Object.fromEntries(
+            Object.entries(parsed.users).map(([username, user]) => [
+              username,
+              {
+                guilds: Array.isArray(user?.guilds)
+                  ? user.guilds.map((guild) => ({
+                      id: guild.id,
+                      name: guild.name,
+                      weekStartDate: guild.weekStartDate || todayString(),
+                      entries: Array.isArray(guild?.entries)
+                        ? guild.entries.map(normalizeEntry)
+                        : [],
+                    }))
+                  : [],
+              },
+            ]),
+          )
+        : {}
+
+    const hasGuestData = guestEntries.length > 0
+    const hasUserData = Object.values(users).some((user) => user.guilds.length > 0)
+    if (!hasGuestData && !hasUserData) {
+      return null
+    }
+
     return {
       guest: {
-        entries: Array.isArray(parsed?.guest?.entries) ? parsed.guest.entries : [],
+        entries: guestEntries,
         weekStartDate: parsed?.guest?.weekStartDate || todayString(),
       },
-      users: parsed?.users && typeof parsed.users === 'object' ? parsed.users : {},
+      users,
     }
   } catch {
-    return createEmptyState()
+    return null
   }
-}
-
-const parseStoredSessionUser = () => {
-  const raw = localStorage.getItem(SESSION_USER_KEY)
-  return raw?.trim() ? raw : null
 }
 
 const createEntry = (draft) => ({
@@ -84,6 +133,7 @@ const createEntry = (draft) => ({
   type: draft.type,
   amount: Number(draft.amount),
   date: draft.date,
+  user: draft.user.trim(),
   notes: draft.notes.trim(),
 })
 
@@ -97,6 +147,7 @@ const defaultEntryDraft = {
   type: 'deposit',
   amount: '',
   date: todayString(),
+  user: '',
   notes: '',
 }
 
@@ -119,11 +170,60 @@ const sortableEntryColumns = {
     label: 'Notes',
     getValue: (entry) => entry.notes || '',
   },
+  user: {
+    label: 'User',
+    getValue: (entry) => entry.user || '',
+  },
 }
 
 const guildDrawerWidth = 320
 
+const inviteExpiryOptions = [
+  { value: 'never', label: 'Never expires' },
+  { value: '1', label: '1 hour' },
+  { value: '24', label: '24 hours' },
+  { value: '168', label: '7 days' },
+  { value: '720', label: '30 days' },
+]
+
 const isoToDay = (isoDate) => new Date(`${isoDate}T00:00:00`)
+
+const dayToIso = (date) =>
+  `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(
+    date.getDate(),
+  ).padStart(2, '0')}`
+
+const formatDisplayDate = (isoDate) => {
+  if (!isoDate) {
+    return ''
+  }
+
+  const [year, month, day] = isoDate.split('-')
+  if (!year || !month || !day) {
+    return isoDate
+  }
+
+  return `${month}/${day}/${year}`
+}
+
+const formatDisplayDateRange = (startDate, endDate) =>
+  startDate === endDate
+    ? formatDisplayDate(startDate)
+    : `${formatDisplayDate(startDate)} - ${formatDisplayDate(endDate)}`
+
+const addDays = (date, amount) => {
+  const nextDate = new Date(date)
+  nextDate.setDate(nextDate.getDate() + amount)
+  return nextDate
+}
+
+const startOfWeek = (date) => addDays(date, -date.getDay())
+
+const endOfWeek = (date) => addDays(startOfWeek(date), 6)
+
+const startOfMonth = (date) => new Date(date.getFullYear(), date.getMonth(), 1)
+
+const endOfMonth = (date) => new Date(date.getFullYear(), date.getMonth() + 1, 0)
 
 const computeTotals = (entries, filter) =>
   entries.reduce(
@@ -140,36 +240,110 @@ const computeTotals = (entries, filter) =>
 
 const fmtGold = (value) => `${Math.round(value).toLocaleString()}g`
 
-const statsRows = (entries, weekStartDate) => {
-  const now = new Date()
-  const today = todayString()
-  const month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
+const createTodayStatisticsRange = () => ({
+  startDate: todayString(),
+  endDate: todayString(),
+})
 
-  const weekStart = isoToDay(weekStartDate)
-  const weekEnd = new Date(weekStart)
-  weekEnd.setDate(weekEnd.getDate() + 7)
+const createAllStatisticsRange = (entries) => {
+  const entryDates = entries
+    .map((entry) => entry.date)
+    .filter((date) => typeof date === 'string' && date.length > 0)
+    .sort()
 
-  return [
+  if (entryDates.length === 0) {
+    return createTodayStatisticsRange()
+  }
+
+  return {
+    startDate: entryDates[0],
+    endDate: entryDates[entryDates.length - 1],
+  }
+}
+
+const createCollapsedStatisticsSections = () => ({
+  Daily: false,
+  Weekly: false,
+  Monthly: false,
+  Overall: false,
+})
+
+const resolveStatisticsRange = (statisticsRange) => {
+  const fallbackDate = todayString()
+  let startDate = statisticsRange.startDate || statisticsRange.endDate || fallbackDate
+  let endDate = statisticsRange.endDate || statisticsRange.startDate || fallbackDate
+
+  if (startDate > endDate) {
+    ;[startDate, endDate] = [endDate, startDate]
+  }
+
+  return { startDate, endDate }
+}
+
+const addStatisticsSection = (rows, section, entries) => {
+  rows.push({ section, isSectionHeader: true })
+  rows.push(...entries.map((entry) => ({ ...entry, section, isSectionHeader: false })))
+}
+
+const buildStatisticsRows = (entries, statisticsRange) => {
+  const { startDate, endDate } = resolveStatisticsRange(statisticsRange)
+  const rows = []
+  const dailyRows = []
+  const weeklyRows = []
+  const monthlyRows = []
+  const startDay = isoToDay(startDate)
+  const endDay = isoToDay(endDate)
+  const entryInRange = (entryDate, periodStart, periodEnd) =>
+    entryDate >= startDate &&
+    entryDate <= endDate &&
+    entryDate >= periodStart &&
+    entryDate <= periodEnd
+
+  for (let day = new Date(startDay); day <= endDay; day = addDays(day, 1)) {
+    const dayIso = dayToIso(day)
+    dailyRows.push({
+      label: formatDisplayDate(dayIso),
+      totals: computeTotals(entries, (entry) => entry.date === dayIso),
+    })
+  }
+
+  for (
+    let weekStart = startOfWeek(startDay);
+    weekStart <= endDay;
+    weekStart = addDays(weekStart, 7)
+  ) {
+    const weekStartIso = dayToIso(weekStart)
+    const weekEndIso = dayToIso(endOfWeek(weekStart))
+    weeklyRows.push({
+      label: formatDisplayDateRange(weekStartIso, weekEndIso),
+      totals: computeTotals(entries, (entry) => entryInRange(entry.date, weekStartIso, weekEndIso)),
+    })
+  }
+
+  for (
+    let monthStart = startOfMonth(startDay);
+    monthStart <= endDay;
+    monthStart = new Date(monthStart.getFullYear(), monthStart.getMonth() + 1, 1)
+  ) {
+    const monthStartIso = dayToIso(monthStart)
+    const monthEndIso = dayToIso(endOfMonth(monthStart))
+    monthlyRows.push({
+      label: formatDisplayDateRange(monthStartIso, monthEndIso),
+      totals: computeTotals(entries, (entry) => entryInRange(entry.date, monthStartIso, monthEndIso)),
+    })
+  }
+
+  addStatisticsSection(rows, 'Daily', dailyRows)
+  addStatisticsSection(rows, 'Weekly', weeklyRows)
+  addStatisticsSection(rows, 'Monthly', monthlyRows)
+  addStatisticsSection(rows, 'Overall', [
     {
-      label: 'Daily',
-      totals: computeTotals(entries, (entry) => entry.date === today),
+      label: formatDisplayDateRange(startDate, endDate),
+      totals: computeTotals(entries, (entry) => entry.date >= startDate && entry.date <= endDate),
     },
-    {
-      label: 'Weekly',
-      totals: computeTotals(entries, (entry) => {
-        const entryDate = isoToDay(entry.date)
-        return entryDate >= weekStart && entryDate < weekEnd
-      }),
-    },
-    {
-      label: 'Monthly',
-      totals: computeTotals(entries, (entry) => entry.date.startsWith(month)),
-    },
-    {
-      label: 'Overall',
-      totals: computeTotals(entries, () => true),
-    },
-  ]
+  ])
+
+  return rows
 }
 
 const theme = createTheme({
@@ -186,52 +360,126 @@ const theme = createTheme({
 })
 
 function App() {
-  const [appState, setAppState] = useState(parseStoredState)
-  const [sessionUser, setSessionUser] = useState(parseStoredSessionUser)
+  const [guestState, setGuestState] = useState(createGuestState)
+  const [legacyState, setLegacyState] = useState(readLegacyState)
+  const [serverUser, setServerUser] = useState(null)
+  const [sessionLoading, setSessionLoading] = useState(true)
   const [entryDraft, setEntryDraft] = useState(defaultEntryDraft)
   const [authOpen, setAuthOpen] = useState(false)
   const [authMode, setAuthMode] = useState('login')
   const [authDraft, setAuthDraft] = useState({ username: '', password: '' })
   const [authError, setAuthError] = useState('')
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [settingsInviteCode, setSettingsInviteCode] = useState('')
+  const [settingsInviteError, setSettingsInviteError] = useState('')
+  const [deleteAccountOpen, setDeleteAccountOpen] = useState(false)
+  const [deleteAccountDraft, setDeleteAccountDraft] = useState({ password: '' })
+  const [deleteAccountError, setDeleteAccountError] = useState('')
+  const [guildAccessGuildId, setGuildAccessGuildId] = useState(null)
+  const [guildAccessInviteCode, setGuildAccessInviteCode] = useState('')
+  const [guildAccessError, setGuildAccessError] = useState('')
+  const [guildAccessInviteSingleUse, setGuildAccessInviteSingleUse] = useState(true)
+  const [guildAccessInviteExpiry, setGuildAccessInviteExpiry] = useState('never')
+  const [globalError, setGlobalError] = useState('')
+  const [globalNotice, setGlobalNotice] = useState('')
   const [newGuildName, setNewGuildName] = useState('')
   const [editingEntry, setEditingEntry] = useState(null)
-  const [entryPage, setEntryPage] = useState(1)
+  const [entryPageState, setEntryPageState] = useState({ scope: '', page: 1 })
   const [entriesPerPage, setEntriesPerPage] = useState(entryPageSizeOptions[0])
   const [entrySort, setEntrySort] = useState({ column: 'date', direction: 'desc' })
+  const [statisticsRange, setStatisticsRange] = useState(createTodayStatisticsRange)
+  const [collapsedStatisticsSections, setCollapsedStatisticsSections] = useState(
+    createCollapsedStatisticsSections,
+  )
+  const [authSubmitting, setAuthSubmitting] = useState(false)
+  const [mutationPending, setMutationPending] = useState(false)
 
-  const currentUser = sessionUser ? appState.users[sessionUser] : null
+  const sessionUser = serverUser?.username ?? null
+  const currentUser = serverUser
   const selectedGuild =
     currentUser?.guilds?.find((guild) => guild.id === currentUser.selectedGuildId) ?? null
+  const guildAccessGuild =
+    currentUser?.guilds?.find((guild) => guild.id === guildAccessGuildId) ?? null
 
-  const activeEntries = sessionUser ? selectedGuild?.entries ?? [] : appState.guest.entries
-  const weekStartDate = sessionUser
-    ? selectedGuild?.weekStartDate || todayString()
-    : appState.guest.weekStartDate
+  const activeEntries = sessionUser ? selectedGuild?.entries ?? [] : guestState.entries
+  const legacyUserGuilds = sessionUser ? legacyState?.users?.[sessionUser]?.guilds ?? [] : []
+  const hasLegacyData = Boolean(
+    legacyState && (legacyState.guest.entries.length > 0 || legacyUserGuilds.length > 0),
+  )
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(appState))
-  }, [appState])
+    let isCancelled = false
 
-  useEffect(() => {
-    if (sessionUser && !appState.users[sessionUser]) {
-      setSessionUser(null)
+    const loadSession = async () => {
+      try {
+        const response = await getSession()
+        if (!isCancelled) {
+          setServerUser(response.user)
+          setEntryDraft((prev) => ({
+            ...prev,
+            user: response.user?.username ?? '',
+          }))
+        }
+      } catch (error) {
+        if (!isCancelled) {
+          setGlobalError(error.message)
+        }
+      } finally {
+        if (!isCancelled) {
+          setSessionLoading(false)
+        }
+      }
     }
-  }, [appState.users, sessionUser])
+
+    loadSession()
+
+    return () => {
+      isCancelled = true
+    }
+  }, [])
 
   useEffect(() => {
-    if (sessionUser) {
-      localStorage.setItem(SESSION_USER_KEY, sessionUser)
+    if (!sessionUser || !selectedGuild?.id) {
       return
     }
 
-    localStorage.removeItem(SESSION_USER_KEY)
-  }, [sessionUser])
+    setStatisticsRange(createTodayStatisticsRange())
+  }, [sessionUser, selectedGuild?.id])
 
   useEffect(() => {
-    setEntryPage(1)
-  }, [sessionUser, selectedGuild?.id, entriesPerPage, entrySort.column, entrySort.direction])
+    if (!guildAccessGuildId) {
+      return
+    }
 
-  const stats = statsRows(activeEntries, weekStartDate)
+    if (!guildAccessGuild) {
+      setGuildAccessGuildId(null)
+      setGuildAccessInviteCode('')
+      setGuildAccessError('')
+    }
+  }, [guildAccessGuild, guildAccessGuildId])
+
+  useEffect(() => {
+    if (!sessionUser || !guildAccessGuild?.isOwner) {
+      return undefined
+    }
+
+    const refreshOwnerGuildAccess = async () => {
+      try {
+        const response = await getSession()
+        setServerUser(response.user)
+      } catch {
+        // Keep the current dialog state if a background refresh fails.
+      }
+    }
+
+    const intervalId = window.setInterval(refreshOwnerGuildAccess, 5000)
+
+    return () => {
+      window.clearInterval(intervalId)
+    }
+  }, [guildAccessGuild?.id, guildAccessGuild?.isOwner, sessionUser])
+
+  const statisticsRows = buildStatisticsRows(activeEntries, statisticsRange)
   const sortedEntries = [...activeEntries].sort((leftEntry, rightEntry) => {
     const leftValue = sortableEntryColumns[entrySort.column].getValue(leftEntry)
     const rightValue = sortableEntryColumns[entrySort.column].getValue(rightEntry)
@@ -251,48 +499,26 @@ function App() {
 
     return entrySort.direction === 'asc' ? comparison : -comparison
   })
+  const paginationScope = [
+    sessionUser ?? 'guest',
+    selectedGuild?.id ?? 'noguild',
+    entriesPerPage,
+    entrySort.column,
+    entrySort.direction,
+  ].join(':')
   const totalEntryPages = Math.max(1, Math.ceil(sortedEntries.length / entriesPerPage))
+  const entryPage =
+    entryPageState.scope === paginationScope
+      ? Math.min(entryPageState.page, totalEntryPages)
+      : 1
   const visibleEntries = sortedEntries.slice(
     (entryPage - 1) * entriesPerPage,
     entryPage * entriesPerPage,
   )
 
-  useEffect(() => {
-    setEntryPage((prev) => Math.min(prev, totalEntryPages))
-  }, [totalEntryPages])
-
-  const updateGuest = (updater) => {
-    setAppState((prev) => ({
-      ...prev,
-      guest: updater(prev.guest),
-    }))
-  }
-
-  const updateCurrentUser = (updater) => {
-    if (!sessionUser) {
-      return
-    }
-
-    setAppState((prev) => ({
-      ...prev,
-      users: {
-        ...prev.users,
-        [sessionUser]: updater(prev.users[sessionUser]),
-      },
-    }))
-  }
-
-  const updateSelectedGuild = (updater) => {
-    if (!sessionUser || !selectedGuild) {
-      return
-    }
-
-    updateCurrentUser((user) => ({
-      ...user,
-      guilds: user.guilds.map((guild) =>
-        guild.id === selectedGuild.id ? updater(guild) : guild,
-      ),
-    }))
+  const clearMessages = () => {
+    setGlobalError('')
+    setGlobalNotice('')
   }
 
   const handleEntrySort = (column) => {
@@ -302,67 +528,164 @@ function App() {
     }))
   }
 
-  const saveEntry = () => {
+  const handleApiError = (error) => {
+    setGlobalError(error.message)
+    setGlobalNotice('')
+  }
+
+  const closeSettings = (force = false) => {
+    if (mutationPending && !force) {
+      return
+    }
+
+    setSettingsOpen(false)
+    setSettingsInviteCode('')
+    setSettingsInviteError('')
+  }
+
+  const closeGuildAccess = (force = false) => {
+    if (mutationPending && !force) {
+      return
+    }
+
+    setGuildAccessGuildId(null)
+    setGuildAccessInviteCode('')
+    setGuildAccessError('')
+    setGuildAccessInviteSingleUse(true)
+    setGuildAccessInviteExpiry('never')
+  }
+
+  const persistAuthenticatedUser = (user, notice = '') => {
+    setServerUser(user)
+    setGlobalError('')
+    setGlobalNotice(notice)
+  }
+
+  const maybeImportGuestEntries = async (user) => {
+    if (guestState.entries.length === 0) {
+      return user
+    }
+
+    const hasAccountData = user.guilds.some((guild) => guild.entries.length > 0)
+    let shouldImport = !hasAccountData
+
+    if (hasAccountData) {
+      shouldImport = window.confirm(
+        'This account already has data. Save your current guest page as a new guild profile?',
+      )
+    }
+
+    if (!shouldImport) {
+      return user
+    }
+
+    const importedGuildName = hasAccountData
+      ? `Imported Guest Guild ${user.guilds.length + 1}`
+      : 'Imported Guest Guild'
+    const response = await importGuestGuild({
+      name: importedGuildName,
+      weekStartDate: guestState.weekStartDate,
+      entries: guestState.entries,
+    })
+
+    setGuestState(createGuestState())
+    return response.user
+  }
+
+  const saveEntry = async () => {
     if (!entryDraft.amount || Number(entryDraft.amount) <= 0 || !entryDraft.date) {
       return
     }
 
-    const nextEntry = createEntry(entryDraft)
+    clearMessages()
 
-    if (sessionUser) {
-      if (!selectedGuild) {
-        return
-      }
-
-      updateSelectedGuild((guild) => ({
-        ...guild,
-        entries: [nextEntry, ...guild.entries],
+    if (!sessionUser) {
+      const nextEntry = createEntry(entryDraft)
+      setGuestState((prev) => ({
+        ...prev,
+        entries: [nextEntry, ...prev.entries],
       }))
-    } else {
-      updateGuest((guest) => ({
-        ...guest,
-        entries: [nextEntry, ...guest.entries],
-      }))
+      setEntryDraft({ ...defaultEntryDraft, date: todayString(), user: '' })
+      setGlobalNotice('Guest entry added. Create an account to store data on the server.')
+      return
     }
 
-    setEntryDraft({ ...defaultEntryDraft, date: todayString() })
+    if (!selectedGuild) {
+      return
+    }
+
+    setMutationPending(true)
+    try {
+      const response = await createEntryForGuild(selectedGuild.id, entryDraft)
+      persistAuthenticatedUser(response.user, 'Entry saved securely.')
+      setEntryDraft({ ...defaultEntryDraft, date: todayString(), user: sessionUser ?? '' })
+    } catch (error) {
+      handleApiError(error)
+    } finally {
+      setMutationPending(false)
+    }
   }
 
-  const updateEntry = (entryId, updater) => {
-    if (sessionUser) {
-      updateSelectedGuild((guild) => ({
-        ...guild,
-        entries: guild.entries.map((entry) =>
-          entry.id === entryId ? updater(entry) : entry,
+  const updateEntry = async (entryId, updater) => {
+    if (!sessionUser) {
+      setGuestState((prev) => ({
+        ...prev,
+        entries: prev.entries.map((entry) =>
+          entry.id === entryId ? normalizeEntry(updater(entry)) : entry,
         ),
       }))
-      return
+      return true
     }
 
-    updateGuest((guest) => ({
-      ...guest,
-      entries: guest.entries.map((entry) =>
-        entry.id === entryId ? updater(entry) : entry,
-      ),
-    }))
+    if (!selectedGuild) {
+      return false
+    }
+
+    const existingEntry = selectedGuild.entries.find((entry) => entry.id === entryId)
+    if (!existingEntry) {
+      return false
+    }
+
+    setMutationPending(true)
+    try {
+      const response = await updateEntryInGuild(selectedGuild.id, entryId, updater(existingEntry))
+      persistAuthenticatedUser(response.user, 'Entry updated securely.')
+      return true
+    } catch (error) {
+      handleApiError(error)
+      return false
+    } finally {
+      setMutationPending(false)
+    }
   }
 
-  const deleteEntry = (entryId) => {
-    if (sessionUser) {
-      updateSelectedGuild((guild) => ({
-        ...guild,
-        entries: guild.entries.filter((entry) => entry.id !== entryId),
+  const deleteEntry = async (entryId) => {
+    clearMessages()
+
+    if (!sessionUser) {
+      setGuestState((prev) => ({
+        ...prev,
+        entries: prev.entries.filter((entry) => entry.id !== entryId),
       }))
       return
     }
 
-    updateGuest((guest) => ({
-      ...guest,
-      entries: guest.entries.filter((entry) => entry.id !== entryId),
-    }))
+    if (!selectedGuild) {
+      return
+    }
+
+    setMutationPending(true)
+    try {
+      const response = await deleteEntryFromGuild(selectedGuild.id, entryId)
+      persistAuthenticatedUser(response.user, 'Entry removed.')
+    } catch (error) {
+      handleApiError(error)
+    } finally {
+      setMutationPending(false)
+    }
   }
 
-  const handleAuth = () => {
+  const handleAuth = async () => {
     const username = authDraft.username.trim().toLowerCase()
     const password = authDraft.password
 
@@ -371,145 +694,324 @@ function App() {
       return
     }
 
-    const existing = appState.users[username]
+    setAuthSubmitting(true)
+    setAuthError('')
+    clearMessages()
 
-    if (authMode === 'signup') {
-      if (existing) {
-        setAuthError('That username already exists.')
-        return
-      }
-    } else if (!existing || existing.password !== password) {
-      setAuthError('Invalid username or password.')
+    try {
+      const response = authMode === 'signup'
+        ? await signUp({ username, password })
+        : await logIn({ username, password })
+      let nextUser = response.user
+
+      nextUser = await maybeImportGuestEntries(nextUser)
+      setServerUser(nextUser)
+      setEntryDraft((prev) => ({
+        ...prev,
+        user: nextUser.username,
+      }))
+      setAuthOpen(false)
+      setAuthDraft({ username: '', password: '' })
+      setGlobalNotice(
+        authMode === 'signup'
+          ? 'Account created. Your data is now stored on the server.'
+          : 'Logged in successfully.',
+      )
+    } catch (error) {
+      setAuthError(error.message)
+    } finally {
+      setAuthSubmitting(false)
+    }
+  }
+
+  const handleLogout = async () => {
+    clearMessages()
+    setMutationPending(true)
+
+    try {
+      await logOut()
+      setServerUser(null)
+      setEntryDraft((prev) => ({
+        ...prev,
+        user: '',
+      }))
+      setGlobalNotice('Logged out.')
+    } catch (error) {
+      handleApiError(error)
+    } finally {
+      setMutationPending(false)
+    }
+  }
+
+  const handleDeleteAccount = async () => {
+    if (!deleteAccountDraft.password) {
+      setDeleteAccountError('Enter your password to confirm account deletion.')
       return
     }
 
-    setAppState((prev) => {
-      const users = { ...prev.users }
-      if (authMode === 'signup') {
-        users[username] = {
-          password,
-          guilds: [],
-          selectedGuildId: null,
-        }
-      }
+    clearMessages()
+    setDeleteAccountError('')
+    setMutationPending(true)
 
-      const user = users[username]
-      const hasGuestEntries = prev.guest.entries.length > 0
-      const hasAccountData = user.guilds.some((guild) => guild.entries.length > 0)
-      let nextGuest = prev.guest
-      let nextGuilds = user.guilds
-      let nextSelectedGuildId = user.selectedGuildId
-
-      if (hasGuestEntries) {
-        if (!hasAccountData) {
-          const guildId = crypto.randomUUID()
-          nextGuilds = [
-            ...user.guilds,
-            {
-              id: guildId,
-              name: 'Imported Guest Guild',
-              entries: prev.guest.entries,
-              weekStartDate: prev.guest.weekStartDate,
-            },
-          ]
-          nextSelectedGuildId = nextSelectedGuildId || guildId
-        } else if (
-          window.confirm(
-            'This account already has data. Save your current guest page as a new guild profile?',
-          )
-        ) {
-          const guildId = crypto.randomUUID()
-          nextGuilds = [
-            ...user.guilds,
-            {
-              id: guildId,
-              name: `Imported Guest Guild ${user.guilds.length + 1}`,
-              entries: prev.guest.entries,
-              weekStartDate: prev.guest.weekStartDate,
-            },
-          ]
-          nextSelectedGuildId = guildId
-        }
-
-        nextGuest = {
-          entries: [],
-          weekStartDate: todayString(),
-        }
-      }
-
-      if (!nextSelectedGuildId && nextGuilds.length > 0) {
-        nextSelectedGuildId = nextGuilds[0].id
-      }
-
-      users[username] = {
-        ...user,
-        guilds: nextGuilds,
-        selectedGuildId: nextSelectedGuildId,
-      }
-
-      return {
+    try {
+      await deleteAccount({ password: deleteAccountDraft.password })
+      setServerUser(null)
+      setDeleteAccountOpen(false)
+      setDeleteAccountDraft({ password: '' })
+      setEntryDraft((prev) => ({
         ...prev,
-        guest: nextGuest,
-        users,
-      }
-    })
-
-    setSessionUser(username)
-    setAuthOpen(false)
-    setAuthError('')
-    setAuthDraft({ username: '', password: '' })
+        user: '',
+      }))
+      setGlobalNotice('Account deleted.')
+    } catch (error) {
+      setDeleteAccountError(error.message)
+    } finally {
+      setMutationPending(false)
+    }
   }
 
-  const createGuild = () => {
+  const handleOpenDeleteAccountFromSettings = () => {
+    setSettingsOpen(false)
+    setDeleteAccountOpen(true)
+  }
+
+  const handleOpenGuildAccess = (guildId) => {
+    setGuildAccessGuildId(guildId)
+    setGuildAccessInviteCode('')
+    setGuildAccessError('')
+    setGuildAccessInviteSingleUse(true)
+    setGuildAccessInviteExpiry('never')
+  }
+
+  const handleCreateGuildInvite = async () => {
+    if (!guildAccessGuild?.isOwner) {
+      return
+    }
+
+    clearMessages()
+    setGuildAccessError('')
+    setMutationPending(true)
+
+    try {
+      const response = await createGuildInvite(guildAccessGuild.id, {
+        singleUse: guildAccessInviteSingleUse,
+        expiresInHours: guildAccessInviteExpiry === 'never' ? null : Number(guildAccessInviteExpiry),
+      })
+      setGuildAccessInviteCode(response.code)
+      setGlobalNotice(`Invite code created for ${guildAccessGuild.name}.`)
+    } catch (error) {
+      setGuildAccessError(error.message)
+    } finally {
+      setMutationPending(false)
+    }
+  }
+
+  const handleRedeemInviteCode = async () => {
+    if (!settingsInviteCode.trim()) {
+      setSettingsInviteError('Enter an invite code.')
+      return
+    }
+
+    clearMessages()
+    setSettingsInviteError('')
+    setMutationPending(true)
+
+    try {
+      const response = await redeemGuildInvite(settingsInviteCode)
+      persistAuthenticatedUser(response.user, 'Invite accepted. You can now edit that guild.')
+      closeSettings(true)
+    } catch (error) {
+      setSettingsInviteError(error.message)
+    } finally {
+      setMutationPending(false)
+    }
+  }
+
+  const handleRemoveGuildMember = async (guild, member) => {
+    if (!guild?.isOwner || member.isOwner) {
+      return
+    }
+
+    if (!window.confirm(`Remove ${member.username} from ${guild.name}?`)) {
+      return
+    }
+
+    clearMessages()
+    setGuildAccessError('')
+    setMutationPending(true)
+
+    try {
+      const response = await removeGuildMemberRequest(guild.id, member.userId)
+      persistAuthenticatedUser(response.user, `${member.username} was removed from ${guild.name}.`)
+    } catch (error) {
+      setGuildAccessError(error.message)
+    } finally {
+      setMutationPending(false)
+    }
+  }
+
+  const handleLeaveGuild = async (guild) => {
+    if (!guild || guild.isOwner) {
+      return
+    }
+
+    if (!window.confirm(`Leave ${guild.name}? You will lose access to its entries unless invited again.`)) {
+      return
+    }
+
+    clearMessages()
+    setMutationPending(true)
+
+    try {
+      const response = await leaveGuildRequest(guild.id)
+      persistAuthenticatedUser(response.user, `You left ${guild.name}.`)
+    } catch (error) {
+      handleApiError(error)
+    } finally {
+      setMutationPending(false)
+    }
+  }
+
+  const handleCreateGuild = async () => {
     if (!newGuildName.trim()) {
       return
     }
 
-    const guildId = crypto.randomUUID()
-    updateCurrentUser((user) => ({
-      ...user,
-      guilds: [
-        ...user.guilds,
-        {
-          id: guildId,
-          name: newGuildName.trim(),
-          entries: [],
-          weekStartDate: todayString(),
-        },
-      ],
-      selectedGuildId: guildId,
-    }))
-    setNewGuildName('')
+    clearMessages()
+    setMutationPending(true)
+    try {
+      const response = await createGuild({ name: newGuildName.trim(), weekStartDate: todayString() })
+      persistAuthenticatedUser(response.user, 'Guild created securely.')
+      setNewGuildName('')
+    } catch (error) {
+      handleApiError(error)
+    } finally {
+      setMutationPending(false)
+    }
   }
 
-  const renameGuild = (guildId, currentName) => {
+  const handleRenameGuild = async (guildId, currentName) => {
     const nextName = window.prompt('Guild name', currentName)
     if (!nextName?.trim()) {
       return
     }
 
-    updateCurrentUser((user) => ({
-      ...user,
-      guilds: user.guilds.map((guild) =>
-        guild.id === guildId ? { ...guild, name: nextName.trim() } : guild,
-      ),
-    }))
+    clearMessages()
+    setMutationPending(true)
+    try {
+      const response = await renameGuild(guildId, nextName.trim())
+      persistAuthenticatedUser(response.user, 'Guild renamed.')
+    } catch (error) {
+      handleApiError(error)
+    } finally {
+      setMutationPending(false)
+    }
   }
 
-  const deleteGuild = (guildId) => {
+  const handleDeleteGuild = async (guildId) => {
     if (!window.confirm('Delete this guild profile and all of its entries?')) {
       return
     }
 
-    updateCurrentUser((user) => {
-      const nextGuilds = user.guilds.filter((guild) => guild.id !== guildId)
-      return {
-        ...user,
-        guilds: nextGuilds,
-        selectedGuildId:
-          user.selectedGuildId === guildId ? nextGuilds[0]?.id ?? null : user.selectedGuildId,
+    clearMessages()
+    setMutationPending(true)
+    try {
+      const response = await deleteGuild(guildId)
+      persistAuthenticatedUser(response.user, 'Guild deleted.')
+    } catch (error) {
+      handleApiError(error)
+    } finally {
+      setMutationPending(false)
+    }
+  }
+
+  const handleSelectGuild = async (guildId) => {
+    if (!sessionUser || guildId === currentUser?.selectedGuildId) {
+      return
+    }
+
+    clearMessages()
+    setMutationPending(true)
+    try {
+      const response = await selectGuild(guildId)
+      persistAuthenticatedUser(response.user)
+    } catch (error) {
+      handleApiError(error)
+    } finally {
+      setMutationPending(false)
+    }
+  }
+
+  const handleStatisticsRangeChange = (field, value) => {
+    setStatisticsRange((prev) => {
+      const nextRange = {
+        ...prev,
+        [field]: value,
       }
+
+      if (nextRange.startDate && nextRange.endDate && nextRange.startDate > nextRange.endDate) {
+        if (field === 'startDate') {
+          nextRange.endDate = value
+        } else {
+          nextRange.startDate = value
+        }
+      }
+
+      return nextRange
     })
+  }
+
+  const toggleStatisticsSection = (section) => {
+    setCollapsedStatisticsSections((prev) => ({
+      ...prev,
+      [section]: !prev[section],
+    }))
+  }
+
+  const handleLegacyImport = async () => {
+    if (!sessionUser || !legacyState) {
+      return
+    }
+
+    const legacyImports = []
+    if (legacyState.guest.entries.length > 0) {
+      legacyImports.push({
+        name: 'Legacy Guest Guild',
+        weekStartDate: legacyState.guest.weekStartDate,
+        entries: legacyState.guest.entries,
+      })
+    }
+
+    for (const guild of legacyUserGuilds) {
+      legacyImports.push({
+        name: guild.name,
+        weekStartDate: guild.weekStartDate,
+        entries: guild.entries,
+      })
+    }
+
+    if (legacyImports.length === 0) {
+      return
+    }
+
+    clearMessages()
+    setMutationPending(true)
+    try {
+      let nextUser = serverUser
+      for (const guild of legacyImports) {
+        const response = await importGuestGuild(guild)
+        nextUser = response.user
+      }
+
+      window.localStorage.removeItem(LEGACY_STORAGE_KEY)
+      window.localStorage.removeItem(LEGACY_SESSION_USER_KEY)
+      setLegacyState(null)
+      persistAuthenticatedUser(nextUser, 'Legacy browser data imported to the server.')
+    } catch (error) {
+      handleApiError(error)
+    } finally {
+      setMutationPending(false)
+    }
   }
 
   return (
@@ -524,12 +1026,15 @@ function App() {
             {sessionUser ? (
               <Stack direction="row" spacing={1} alignItems="center">
                 <Chip label={`Logged in: ${sessionUser}`} color="primary" />
-                <Button color="inherit" onClick={() => setSessionUser(null)}>
+                <IconButton color="inherit" onClick={() => setSettingsOpen(true)} disabled={mutationPending}>
+                  <SettingsIcon />
+                </IconButton>
+                <Button color="inherit" onClick={handleLogout} disabled={mutationPending}>
                   Log out
                 </Button>
               </Stack>
             ) : (
-              <Button color="inherit" onClick={() => setAuthOpen(true)}>
+              <Button color="inherit" onClick={() => setAuthOpen(true)} disabled={sessionLoading}>
                 Sign up / Log in
               </Button>
             )}
@@ -544,6 +1049,42 @@ function App() {
             <Typography variant="body1" sx={{ mb: 3, color: 'text.secondary' }}>
               Log deposits, withdrawals, and sales tax income with editable notes.
             </Typography>
+
+            <Stack spacing={2} sx={{ mb: 3 }}>
+              {sessionLoading && <Alert severity="info">Restoring your secure session...</Alert>}
+              {globalError && (
+                <Alert severity="error" onClose={() => setGlobalError('')}>
+                  {globalError}
+                </Alert>
+              )}
+              {globalNotice && (
+                <Alert severity="success" onClose={() => setGlobalNotice('')}>
+                  {globalNotice}
+                </Alert>
+              )}
+              {hasLegacyData && sessionUser && (
+                <Alert
+                  severity="info"
+                  action={
+                    <Button color="inherit" size="small" onClick={handleLegacyImport}>
+                      Import now
+                    </Button>
+                  }
+                >
+                  Legacy browser data was detected for this account. Import it into the secure server.
+                </Alert>
+              )}
+              {legacyState && !sessionUser && !sessionLoading && (
+                <Alert severity="info">
+                  Legacy browser data was detected. Sign in to import it into the secure server.
+                </Alert>
+              )}
+              {!sessionUser && !sessionLoading && (
+                <Alert severity="warning">
+                  Guest mode is temporary. Create an account to store data on the server for publication.
+                </Alert>
+              )}
+            </Stack>
 
             <Card sx={{ mb: 3 }}>
               <CardContent>
@@ -592,13 +1133,21 @@ function App() {
                     />
                     <TextField
                       fullWidth
+                      label="User"
+                      value={entryDraft.user}
+                      onChange={(event) =>
+                        setEntryDraft((prev) => ({ ...prev, user: event.target.value }))
+                      }
+                    />
+                    <TextField
+                      fullWidth
                       label="Optional Notes"
                       value={entryDraft.notes}
                       onChange={(event) =>
                         setEntryDraft((prev) => ({ ...prev, notes: event.target.value }))
                       }
                     />
-                    <Button variant="contained" onClick={saveEntry}>
+                    <Button variant="contained" onClick={saveEntry} disabled={mutationPending}>
                       Save
                     </Button>
                   </Stack>
@@ -614,22 +1163,33 @@ function App() {
                   justifyContent="space-between"
                   sx={{ mb: 2 }}
                 >
-                  <Typography variant="h6">Stats</Typography>
-                  <TextField
-                    label="Weekly stats start"
-                    type="date"
-                    value={weekStartDate}
-                    onChange={(event) => {
-                      const nextDate = event.target.value
-                      if (sessionUser) {
-                        updateSelectedGuild((guild) => ({ ...guild, weekStartDate: nextDate }))
-                      } else {
-                        updateGuest((guest) => ({ ...guest, weekStartDate: nextDate }))
-                      }
-                    }}
-                    InputLabelProps={{ shrink: true }}
-                    sx={{ maxWidth: 250 }}
-                  />
+                  <Typography variant="h6">Statistics</Typography>
+                  <Stack direction="row" spacing={1.5} alignItems="center" flexWrap="wrap">
+                    <TextField
+                      type="date"
+                      value={statisticsRange.startDate}
+                      onChange={(event) => handleStatisticsRangeChange('startDate', event.target.value)}
+                      inputProps={{ 'aria-label': 'Start date' }}
+                      sx={{ minWidth: 170 }}
+                    />
+                    <Typography variant="body1">&ndash;</Typography>
+                    <TextField
+                      type="date"
+                      value={statisticsRange.endDate}
+                      onChange={(event) => handleStatisticsRangeChange('endDate', event.target.value)}
+                      inputProps={{ 'aria-label': 'End date' }}
+                      sx={{ minWidth: 170 }}
+                    />
+                    <Button
+                      variant="outlined"
+                      onClick={() => setStatisticsRange(createAllStatisticsRange(activeEntries))}
+                    >
+                      All
+                    </Button>
+                    <Button variant="outlined" onClick={() => setStatisticsRange(createTodayStatisticsRange())}>
+                      Today
+                    </Button>
+                  </Stack>
                 </Stack>
                 <Table size="small">
                   <TableHead>
@@ -642,16 +1202,52 @@ function App() {
                     </TableRow>
                   </TableHead>
                   <TableBody>
-                    {stats.map((statRow) => {
+                    {statisticsRows.map((statisticsRow) => {
+                      if (statisticsRow.isSectionHeader) {
+                        return (
+                          <TableRow key={statisticsRow.section}>
+                            <TableCell colSpan={5} sx={{ fontWeight: 700, pt: 2, pb: 1 }}>
+                              <Stack
+                                direction="row"
+                                spacing={1}
+                                alignItems="center"
+                                sx={{ cursor: 'pointer' }}
+                                onClick={() => toggleStatisticsSection(statisticsRow.section)}
+                              >
+                                <IconButton size="small" aria-label={`Toggle ${statisticsRow.section}`}>
+                                  {collapsedStatisticsSections[statisticsRow.section] ? (
+                                    <ExpandMoreIcon fontSize="small" />
+                                  ) : (
+                                    <ExpandLessIcon fontSize="small" />
+                                  )}
+                                </IconButton>
+                                <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                                  {statisticsRow.section}
+                                </Typography>
+                              </Stack>
+                            </TableCell>
+                          </TableRow>
+                        )
+                      }
+
+                      if (collapsedStatisticsSections[statisticsRow.section]) {
+                        return null
+                      }
+
                       const grandTotal =
-                        statRow.totals.deposit + statRow.totals.salesTax - statRow.totals.withdrawal
+                        statisticsRow.totals.deposit +
+                        statisticsRow.totals.salesTax -
+                        statisticsRow.totals.withdrawal
+
                       return (
-                        <TableRow key={statRow.label}>
-                          <TableCell>{statRow.label}</TableCell>
-                          <TableCell align="right">{fmtGold(statRow.totals.deposit)}</TableCell>
-                          <TableCell align="right">{fmtGold(statRow.totals.withdrawal)}</TableCell>
-                          <TableCell align="right">{fmtGold(statRow.totals.salesTax)}</TableCell>
-                          <TableCell align="right">{fmtGold(grandTotal)}</TableCell>
+                        <TableRow key={`${statisticsRow.section}-${statisticsRow.label}`}>
+                          <TableCell>{statisticsRow.label}</TableCell>
+                          <TableCell align="right">{fmtGold(statisticsRow.totals.deposit)}</TableCell>
+                          <TableCell align="right">{fmtGold(statisticsRow.totals.withdrawal)}</TableCell>
+                          <TableCell align="right">{fmtGold(statisticsRow.totals.salesTax)}</TableCell>
+                          <TableCell align="right" sx={grandTotal < 0 ? { color: 'error.main' } : undefined}>
+                            {fmtGold(grandTotal)}
+                          </TableCell>
                         </TableRow>
                       )
                     })}
@@ -681,7 +1277,9 @@ function App() {
                       color="primary"
                       count={totalEntryPages}
                       page={entryPage}
-                      onChange={(_event, value) => setEntryPage(value)}
+                      onChange={(_event, value) =>
+                        setEntryPageState({ scope: paginationScope, page: value })
+                      }
                       size="small"
                       showFirstButton
                       showLastButton
@@ -726,6 +1324,15 @@ function App() {
                           Type
                         </TableSortLabel>
                       </TableCell>
+                      <TableCell sortDirection={entrySort.column === 'user' ? entrySort.direction : false}>
+                        <TableSortLabel
+                          active={entrySort.column === 'user'}
+                          direction={entrySort.column === 'user' ? entrySort.direction : 'asc'}
+                          onClick={() => handleEntrySort('user')}
+                        >
+                          User
+                        </TableSortLabel>
+                      </TableCell>
                       <TableCell
                         align="right"
                         sortDirection={entrySort.column === 'amount' ? entrySort.direction : false}
@@ -753,24 +1360,25 @@ function App() {
                   <TableBody>
                     {activeEntries.length === 0 ? (
                       <TableRow>
-                        <TableCell colSpan={5} align="center">
+                        <TableCell colSpan={6} align="center">
                           No entries yet.
                         </TableCell>
                       </TableRow>
                     ) : (
                       visibleEntries.map((entry) => (
                         <TableRow key={entry.id}>
-                          <TableCell>{entry.date}</TableCell>
+                          <TableCell>{formatDisplayDate(entry.date)}</TableCell>
                           <TableCell>
                             {entryTypes.find((entryType) => entryType.value === entry.type)?.label}
                           </TableCell>
+                          <TableCell>{entry.user || '—'}</TableCell>
                           <TableCell align="right">{fmtGold(entry.amount)}</TableCell>
                           <TableCell>{entry.notes || '—'}</TableCell>
                           <TableCell align="right">
                             <IconButton onClick={() => setEditingEntry({ ...entry })}>
                               <EditIcon />
                             </IconButton>
-                            <IconButton onClick={() => deleteEntry(entry.id)}>
+                            <IconButton onClick={() => deleteEntry(entry.id)} disabled={mutationPending}>
                               <DeleteIcon />
                             </IconButton>
                           </TableCell>
@@ -784,112 +1392,73 @@ function App() {
           </Box>
 
           {sessionUser && (
-            <Drawer
-              anchor="right"
-              variant="permanent"
-              sx={{
-                width: guildDrawerWidth,
-                flexShrink: 0,
-                '& .MuiDrawer-paper': {
-                  width: guildDrawerWidth,
-                  boxSizing: 'border-box',
-                  p: 2,
-                  top: { xs: 56, sm: 64 },
-                  height: { xs: 'calc(100% - 56px)', sm: 'calc(100% - 64px)' },
-                },
-              }}
-            >
-              <Typography variant="h6" sx={{ mt: 1 }}>
-                Guild Profiles
-              </Typography>
-              <Stack direction="row" spacing={1} sx={{ my: 2 }}>
-                <TextField
-                  size="small"
-                  label="New guild"
-                  value={newGuildName}
-                  onChange={(event) => setNewGuildName(event.target.value)}
-                  fullWidth
-                />
-                <Button variant="contained" onClick={createGuild}>
-                  Add
-                </Button>
-              </Stack>
-              <Divider sx={{ mb: 1 }} />
-              <List dense>
-                {currentUser?.guilds?.map((guild) => (
-                  <ListItem
-                    key={guild.id}
-                    disablePadding
-                    secondaryAction={
-                      <Stack direction="row" spacing={0.5}>
-                        <IconButton edge="end" onClick={() => renameGuild(guild.id, guild.name)}>
-                          <EditIcon fontSize="small" />
-                        </IconButton>
-                        <IconButton edge="end" onClick={() => deleteGuild(guild.id)}>
-                          <DeleteIcon fontSize="small" />
-                        </IconButton>
-                      </Stack>
-                    }
-                  >
-                    <ListItemButton
-                      selected={guild.id === currentUser.selectedGuildId}
-                      onClick={() =>
-                        updateCurrentUser((user) => ({ ...user, selectedGuildId: guild.id }))
-                      }
-                    >
-                      <ListItemText
-                        primary={guild.name}
-                        secondary={`${guild.entries.length} entries`}
-                      />
-                    </ListItemButton>
-                  </ListItem>
-                ))}
-              </List>
-            </Drawer>
+            <GuildProfilesDrawer
+              currentUser={currentUser}
+              guildDrawerWidth={guildDrawerWidth}
+              newGuildName={newGuildName}
+              setNewGuildName={setNewGuildName}
+              handleCreateGuild={handleCreateGuild}
+              mutationPending={mutationPending}
+              handleOpenGuildAccess={handleOpenGuildAccess}
+              handleRenameGuild={handleRenameGuild}
+              handleDeleteGuild={handleDeleteGuild}
+              handleLeaveGuild={handleLeaveGuild}
+              handleSelectGuild={handleSelectGuild}
+            />
           )}
 
           {sessionUser && <Box sx={{ width: guildDrawerWidth, flexShrink: 0 }} />}
         </Box>
       </Box>
 
-      <Dialog open={authOpen} onClose={() => setAuthOpen(false)}>
-        <DialogTitle>{authMode === 'login' ? 'Log in' : 'Create account'}</DialogTitle>
-        <DialogContent>
-          <Stack spacing={2} sx={{ mt: 1, minWidth: 320 }}>
-            {authError && <Alert severity="error">{authError}</Alert>}
-            <TextField
-              label="Username"
-              value={authDraft.username}
-              onChange={(event) =>
-                setAuthDraft((prev) => ({ ...prev, username: event.target.value }))
-              }
-              fullWidth
-            />
-            <TextField
-              label="Password"
-              type="password"
-              value={authDraft.password}
-              onChange={(event) =>
-                setAuthDraft((prev) => ({ ...prev, password: event.target.value }))
-              }
-              fullWidth
-            />
-          </Stack>
-        </DialogContent>
-        <DialogActions sx={{ justifyContent: 'space-between', px: 3, pb: 2 }}>
-          <Button
-            onClick={() => {
-              setAuthMode((prev) => (prev === 'login' ? 'signup' : 'login'))
-              setAuthError('')
-            }}
-          >
-            {authMode === 'login' ? 'Need an account?' : 'Have an account?'}
-          </Button>
-          <Button variant="contained" onClick={handleAuth}>
-            {authMode === 'login' ? 'Log in' : 'Create account'}
-          </Button>
-        </DialogActions>
-      </Dialog>
+      <AuthDialog
+        authOpen={authOpen}
+        setAuthOpen={setAuthOpen}
+        authMode={authMode}
+        setAuthMode={setAuthMode}
+        authError={authError}
+        authDraft={authDraft}
+        setAuthDraft={setAuthDraft}
+        authSubmitting={authSubmitting}
+        handleAuth={handleAuth}
+      />
+
+      <SettingsDialog
+        settingsOpen={settingsOpen}
+        closeSettings={closeSettings}
+        mutationPending={mutationPending}
+        settingsInviteError={settingsInviteError}
+        settingsInviteCode={settingsInviteCode}
+        setSettingsInviteCode={setSettingsInviteCode}
+        handleRedeemInviteCode={handleRedeemInviteCode}
+        handleOpenDeleteAccountFromSettings={handleOpenDeleteAccountFromSettings}
+      />
+
+      <DeleteAccountDialog
+        deleteAccountOpen={deleteAccountOpen}
+        mutationPending={mutationPending}
+        setDeleteAccountOpen={setDeleteAccountOpen}
+        deleteAccountDraft={deleteAccountDraft}
+        setDeleteAccountDraft={setDeleteAccountDraft}
+        deleteAccountError={deleteAccountError}
+        setDeleteAccountError={setDeleteAccountError}
+        handleDeleteAccount={handleDeleteAccount}
+      />
+
+      <GuildAccessDialog
+        guildAccessGuild={guildAccessGuild}
+        closeGuildAccess={closeGuildAccess}
+        guildAccessError={guildAccessError}
+        guildAccessInviteSingleUse={guildAccessInviteSingleUse}
+        setGuildAccessInviteSingleUse={setGuildAccessInviteSingleUse}
+        guildAccessInviteExpiry={guildAccessInviteExpiry}
+        setGuildAccessInviteExpiry={setGuildAccessInviteExpiry}
+        inviteExpiryOptions={inviteExpiryOptions}
+        handleCreateGuildInvite={handleCreateGuildInvite}
+        mutationPending={mutationPending}
+        guildAccessInviteCode={guildAccessInviteCode}
+        handleRemoveGuildMember={handleRemoveGuildMember}
+      />
 
       <Dialog open={Boolean(editingEntry)} onClose={() => setEditingEntry(null)}>
         <DialogTitle>Edit Entry</DialogTitle>
@@ -931,6 +1500,13 @@ function App() {
                 InputLabelProps={{ shrink: true }}
               />
               <TextField
+                label="User"
+                value={editingEntry.user || ''}
+                onChange={(event) =>
+                  setEditingEntry((prev) => ({ ...prev, user: event.target.value }))
+                }
+              />
+              <TextField
                 label="Notes"
                 value={editingEntry.notes}
                 onChange={(event) =>
@@ -956,16 +1532,21 @@ function App() {
           </Button>
           <Button
             variant="contained"
-            onClick={() => {
+            disabled={mutationPending}
+            onClick={async () => {
               if (editingEntry.amount <= 0) {
                 return
               }
 
-              updateEntry(editingEntry.id, () => ({
+              const wasUpdated = await updateEntry(editingEntry.id, () => ({
                 ...editingEntry,
+                user: editingEntry.user.trim(),
                 notes: editingEntry.notes.trim(),
               }))
-              setEditingEntry(null)
+
+              if (wasUpdated) {
+                setEditingEntry(null)
+              }
             }}
           >
             Save
