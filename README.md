@@ -64,16 +64,29 @@ Typical production flow:
 2. Run `npm run build`
 3. Set `NODE_ENV=production`
 4. Set `DATABASE_FILE` to a persistent disk path
-5. Run `npm start`
+5. Set `PUBLIC_APP_URL` to your live canonical URL
+6. Run `npm start`
 
 For Render-style deployments with SQLite persistence, use a mounted disk path such as `/var/data/guild-bank.db`.
+
+Recommended Render health check path:
+
+- `/healthz`
 
 ## Environment Variables
 
 - `PORT`: API and production web server port. Default: `3001`
 - `DATABASE_FILE`: SQLite database path. Use a persistent disk path in production.
+- `PUBLIC_APP_URL`: canonical public site URL. Default: `https://www.esoguildgoldledger.com`
 - `SESSION_COOKIE_NAME`: optional session cookie name override
 - `SESSION_TTL_DAYS`: session lifetime in days. Default: `14`
+
+## Post-Deploy Checklist
+
+1. Confirm the Render health check path is set to `/healthz`
+2. Set `PUBLIC_APP_URL` to `https://www.esoguildgoldledger.com`
+3. Submit `https://www.esoguildgoldledger.com/` and `https://www.esoguildgoldledger.com/sitemap.xml` in Google Search Console
+4. Smoke-test sign up, login, guild creation, and shared-guild invite flows on the live domain
 
 ## Validation
 

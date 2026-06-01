@@ -3,6 +3,7 @@ import cookieParser from 'cookie-parser'
 import Database from 'better-sqlite3'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import helmet from 'helmet'
 import path from 'node:path'
 import process from 'node:process'
 import express from 'express'
@@ -19,6 +20,7 @@ const dbPath = process.env.DATABASE_FILE
 const backupsDirectory = path.join(path.dirname(dbPath), 'backups')
 const port = Number(process.env.PORT) || 3001
 const sessionCookieName = process.env.SESSION_COOKIE_NAME || 'eso_guild_bank_session'
+const publicAppUrl = String(process.env.PUBLIC_APP_URL || 'https://www.esoguildgoldledger.com').replace(/\/$/, '')
 const sessionTtlDays = Number(process.env.SESSION_TTL_DAYS) || 14
 const sessionTtlMs = sessionTtlDays * 24 * 60 * 60 * 1000
 const backupRetentionCount = Number(process.env.BACKUP_RETENTION_COUNT) || 20
@@ -264,8 +266,40 @@ const statements = {
 const app = express()
 
 app.disable('x-powered-by')
+app.set('trust proxy', isProduction ? 1 : false)
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        baseUri: ["'self'"],
+        connectSrc: ["'self'"],
+        fontSrc: ["'self'", 'https:', 'data:'],
+        formAction: ["'self'"],
+        frameAncestors: ["'none'"],
+        imgSrc: ["'self'", 'https:', 'data:'],
+        objectSrc: ["'none'"],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        upgradeInsecureRequests: isProduction ? [] : null,
+      },
+    },
+    crossOriginOpenerPolicy: { policy: 'same-origin' },
+    crossOriginResourcePolicy: { policy: 'same-origin' },
+    referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+  }),
+)
 app.use(express.json({ limit: '1mb' }))
 app.use(cookieParser())
+
+app.get('/healthz', (_request, response) => {
+  response.json({
+    ok: true,
+    service: 'eso-guild-gold-ledger',
+    publicAppUrl,
+    timestamp: new Date().toISOString(),
+  })
+})
 
 function createHttpError(status, message) {
   const error = new Error(message)
