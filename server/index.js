@@ -91,6 +91,7 @@ db.exec(`
     guild_id TEXT NOT NULL,
     type TEXT NOT NULL,
     amount INTEGER NOT NULL,
+    is_donation INTEGER NOT NULL DEFAULT 0,
     date TEXT NOT NULL,
     user_name TEXT NOT NULL DEFAULT '',
     notes TEXT NOT NULL DEFAULT '',
@@ -167,6 +168,7 @@ db.prepare(
 
 const guildInviteColumns = db.prepare('PRAGMA table_info(guild_invites)').all()
 const userColumns = db.prepare('PRAGMA table_info(users)').all()
+const entryColumns = db.prepare('PRAGMA table_info(entries)').all()
 if (!guildInviteColumns.some((column) => column.name === 'single_use')) {
   db.exec('ALTER TABLE guild_invites ADD COLUMN single_use INTEGER NOT NULL DEFAULT 1')
 }
@@ -178,6 +180,9 @@ if (!userColumns.some((column) => column.name === 'email')) {
 }
 if (!userColumns.some((column) => column.name === 'email_verified_at')) {
   db.exec('ALTER TABLE users ADD COLUMN email_verified_at TEXT')
+}
+if (!entryColumns.some((column) => column.name === 'is_donation')) {
+  db.exec('ALTER TABLE entries ADD COLUMN is_donation INTEGER NOT NULL DEFAULT 0')
 }
 db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique ON users (email) WHERE email IS NOT NULL')
 
@@ -271,7 +276,7 @@ const statements = {
      LIMIT 1`,
   ),
   listEntriesForGuild: db.prepare(
-    `SELECT id, type, amount, date, user_name AS user, notes, created_at AS createdAt
+    `SELECT id, type, amount, is_donation AS isDonation, date, user_name AS user, notes, created_at AS createdAt
      FROM entries
      WHERE guild_id = ?
      ORDER BY date DESC, created_at DESC, id DESC`,
@@ -341,11 +346,11 @@ const statements = {
      VALUES (@actorUserId, @action, @entityType, @entityId, @details)`,
   ),
   createEntry: db.prepare(
-    `INSERT INTO entries (id, guild_id, type, amount, date, user_name, notes)
-     VALUES (@id, @guildId, @type, @amount, @date, @user, @notes)`,
+    `INSERT INTO entries (id, guild_id, type, amount, is_donation, date, user_name, notes)
+     VALUES (@id, @guildId, @type, @amount, @isDonation, @date, @user, @notes)`,
   ),
   findEntryForGuild: db.prepare(
-    `SELECT id, guild_id AS guildId, type, amount, date, user_name AS user, notes
+    `SELECT id, guild_id AS guildId, type, amount, is_donation AS isDonation, date, user_name AS user, notes
      FROM entries
      WHERE id = ? AND guild_id = ?`,
   ),
@@ -353,6 +358,7 @@ const statements = {
     `UPDATE entries
      SET type = @type,
          amount = @amount,
+         is_donation = @isDonation,
          date = @date,
          user_name = @user,
          notes = @notes
@@ -781,6 +787,7 @@ function sanitizeEntryPayload(payload) {
   const date = String(payload?.date || '')
   const user = sanitizeText(payload?.user, 80)
   const notes = sanitizeText(payload?.notes, 500)
+  const isDonation = type === 'deposit' && Boolean(payload?.isDonation)
 
   if (!entryTypes.has(type)) {
     throw createHttpError(400, 'Choose a valid entry type before saving.')
@@ -794,7 +801,7 @@ function sanitizeEntryPayload(payload) {
     throw createHttpError(400, 'Choose a valid entry date in YYYY-MM-DD format.')
   }
 
-  return { type, amount, date, user, notes }
+  return { type, amount, isDonation: isDonation ? 1 : 0, date, user, notes }
 }
 
 function sanitizeGuildName(value) {
@@ -1520,7 +1527,7 @@ app.post('/api/guilds/:guildId/entries', requireAuth, (request, response, next) 
       action: 'entry.create',
       entityType: 'entry',
       entityId: entryId,
-      details: { guildId: guild.id, type: entry.type, amount: entry.amount, date: entry.date },
+      details: { guildId: guild.id, type: entry.type, isDonation: Boolean(entry.isDonation), amount: entry.amount, date: entry.date },
     })
 
     scheduleBackup('entry-create')
@@ -1549,7 +1556,7 @@ app.patch('/api/guilds/:guildId/entries/:entryId', requireAuth, (request, respon
       action: 'entry.update',
       entityType: 'entry',
       entityId: request.params.entryId,
-      details: { guildId: guild.id, type: entry.type, amount: entry.amount, date: entry.date },
+      details: { guildId: guild.id, type: entry.type, isDonation: Boolean(entry.isDonation), amount: entry.amount, date: entry.date },
     })
 
     scheduleBackup('entry-update')

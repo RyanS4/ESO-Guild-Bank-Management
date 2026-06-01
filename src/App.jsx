@@ -6,6 +6,7 @@ import {
   Button,
   Card,
   CardContent,
+  Checkbox,
   Chip,
   CssBaseline,
   Dialog,
@@ -13,6 +14,7 @@ import {
   DialogContent,
   DialogTitle,
   FormControl,
+  FormControlLabel,
   IconButton,
   InputLabel,
   MenuItem,
@@ -84,6 +86,7 @@ const createGuestState = () => ({
 
 const normalizeEntry = (entry) => ({
   ...entry,
+  isDonation: Boolean(entry?.isDonation),
   user: entry?.user?.trim?.() ?? '',
   notes: entry?.notes?.trim?.() ?? '',
 })
@@ -142,6 +145,7 @@ const createEntry = (draft) => ({
   id: crypto.randomUUID(),
   type: draft.type,
   amount: Number(draft.amount),
+  isDonation: draft.type === 'deposit' ? Boolean(draft.isDonation) : false,
   date: draft.date,
   user: draft.user.trim(),
   notes: draft.notes.trim(),
@@ -156,6 +160,7 @@ const entryTypes = [
 const defaultEntryDraft = {
   type: 'deposit',
   amount: '',
+  isDonation: false,
   date: todayString(),
   user: '',
   notes: '',
@@ -248,6 +253,28 @@ const computeTotals = (entries, filter) =>
     { deposit: 0, withdrawal: 0, salesTax: 0 },
   )
 
+const computeTopDepositor = (entries, filter) => {
+  const depositsByUser = entries.reduce((totals, entry) => {
+    if (!filter(entry) || entry.type !== 'deposit' || !entry.isDonation) {
+      return totals
+    }
+
+    const username = entry.user?.trim() || 'Unknown user'
+    totals.set(username, (totals.get(username) || 0) + (Number(entry.amount) || 0))
+    return totals
+  }, new Map())
+
+  let topDepositor = null
+
+  for (const [username, total] of depositsByUser.entries()) {
+    if (!topDepositor || total > topDepositor.amount) {
+      topDepositor = { username, amount: total }
+    }
+  }
+
+  return topDepositor
+}
+
 const fmtGold = (value) => `${Math.round(value).toLocaleString()}g`
 
 const createTodayStatisticsRange = () => ({
@@ -314,6 +341,7 @@ const buildStatisticsRows = (entries, statisticsRange) => {
     dailyRows.push({
       label: formatDisplayDate(dayIso),
       totals: computeTotals(entries, (entry) => entry.date === dayIso),
+      topDepositor: computeTopDepositor(entries, (entry) => entry.date === dayIso),
     })
   }
 
@@ -327,6 +355,7 @@ const buildStatisticsRows = (entries, statisticsRange) => {
     weeklyRows.push({
       label: formatDisplayDateRange(weekStartIso, weekEndIso),
       totals: computeTotals(entries, (entry) => entryInRange(entry.date, weekStartIso, weekEndIso)),
+      topDepositor: computeTopDepositor(entries, (entry) => entryInRange(entry.date, weekStartIso, weekEndIso)),
     })
   }
 
@@ -340,6 +369,7 @@ const buildStatisticsRows = (entries, statisticsRange) => {
     monthlyRows.push({
       label: formatDisplayDateRange(monthStartIso, monthEndIso),
       totals: computeTotals(entries, (entry) => entryInRange(entry.date, monthStartIso, monthEndIso)),
+      topDepositor: computeTopDepositor(entries, (entry) => entryInRange(entry.date, monthStartIso, monthEndIso)),
     })
   }
 
@@ -350,6 +380,7 @@ const buildStatisticsRows = (entries, statisticsRange) => {
     {
       label: formatDisplayDateRange(startDate, endDate),
       totals: computeTotals(entries, (entry) => entry.date >= startDate && entry.date <= endDate),
+      topDepositor: computeTopDepositor(entries, (entry) => entry.date >= startDate && entry.date <= endDate),
     },
   ])
 
@@ -1365,7 +1396,11 @@ function App() {
                         label="Type"
                         value={entryDraft.type}
                         onChange={(event) =>
-                          setEntryDraft((prev) => ({ ...prev, type: event.target.value }))
+                          setEntryDraft((prev) => ({
+                            ...prev,
+                            type: event.target.value,
+                            isDonation: event.target.value === 'deposit' ? prev.isDonation : false,
+                          }))
                         }
                       >
                         {entryTypes.map((entryType) => (
@@ -1410,6 +1445,19 @@ function App() {
                         setEntryDraft((prev) => ({ ...prev, notes: event.target.value }))
                       }
                     />
+                    {entryDraft.type === 'deposit' && (
+                      <FormControlLabel
+                        control={
+                          <Checkbox
+                            checked={entryDraft.isDonation}
+                            onChange={(event) =>
+                              setEntryDraft((prev) => ({ ...prev, isDonation: event.target.checked }))
+                            }
+                          />
+                        }
+                        label="Donation"
+                      />
+                    )}
                     <Button variant="contained" onClick={saveEntry} disabled={mutationPending}>
                       Save
                     </Button>
@@ -1505,7 +1553,16 @@ function App() {
 
                         return (
                           <TableRow key={`${statisticsRow.section}-${statisticsRow.label}`}>
-                            <TableCell>{statisticsRow.label}</TableCell>
+                            <TableCell>
+                              <Stack spacing={0.25}>
+                                <Typography variant="body2">{statisticsRow.label}</Typography>
+                                <Typography variant="caption" color="text.secondary">
+                                  {statisticsRow.topDepositor
+                                    ? `Top depositor: ${statisticsRow.topDepositor.username} (${fmtGold(statisticsRow.topDepositor.amount)})`
+                                    : 'Top depositor: No deposits recorded'}
+                                </Typography>
+                              </Stack>
+                            </TableCell>
                             <TableCell align="right">{fmtGold(statisticsRow.totals.deposit)}</TableCell>
                             <TableCell align="right">{fmtGold(statisticsRow.totals.withdrawal)}</TableCell>
                             <TableCell align="right">{fmtGold(statisticsRow.totals.salesTax)}</TableCell>
@@ -1635,7 +1692,16 @@ function App() {
                           <TableRow key={entry.id}>
                             <TableCell>{formatDisplayDate(entry.date)}</TableCell>
                             <TableCell>
-                              {entryTypes.find((entryType) => entryType.value === entry.type)?.label}
+                              <Stack spacing={0.25}>
+                                <Typography variant="body2">
+                                  {entryTypes.find((entryType) => entryType.value === entry.type)?.label}
+                                </Typography>
+                                {entry.type === 'deposit' && entry.isDonation && (
+                                  <Typography variant="caption" color="text.secondary">
+                                    Donation
+                                  </Typography>
+                                )}
+                              </Stack>
                             </TableCell>
                             <TableCell>{entry.user || '—'}</TableCell>
                             <TableCell align="right">{fmtGold(entry.amount)}</TableCell>
@@ -1776,7 +1842,11 @@ function App() {
                   label="Type"
                   value={editingEntry.type}
                   onChange={(event) =>
-                    setEditingEntry((prev) => ({ ...prev, type: event.target.value }))
+                    setEditingEntry((prev) => ({
+                      ...prev,
+                      type: event.target.value,
+                      isDonation: event.target.value === 'deposit' ? prev.isDonation : false,
+                    }))
                   }
                 >
                   {entryTypes.map((entryType) => (
@@ -1819,6 +1889,19 @@ function App() {
                 multiline
                 minRows={2}
               />
+              {editingEntry.type === 'deposit' && (
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      checked={Boolean(editingEntry.isDonation)}
+                      onChange={(event) =>
+                        setEditingEntry((prev) => ({ ...prev, isDonation: event.target.checked }))
+                      }
+                    />
+                  }
+                  label="Donation"
+                />
+              )}
             </Stack>
           )}
         </DialogContent>
