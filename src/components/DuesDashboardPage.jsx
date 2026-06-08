@@ -7,8 +7,8 @@ import {
   CardContent,
   Checkbox,
   Chip,
-  FormControl,
   FormControlLabel,
+  FormControl,
   InputLabel,
   MenuItem,
   Select,
@@ -19,115 +19,110 @@ import {
   TableContainer,
   TableHead,
   TableRow,
+  TableSortLabel,
   TextField,
   Typography,
 } from '@mui/material'
+import { formatDisplayDate } from '../utils/dateFormatting'
+import { buildMemberManagementSnapshot } from '../utils/memberDues'
 
-const EST_TIME_ZONE = 'America/New_York'
-const EST_DATE_FORMATTER = new Intl.DateTimeFormat('en-CA', {
-  timeZone: EST_TIME_ZONE,
-  year: 'numeric',
-  month: '2-digit',
-  day: '2-digit',
-})
-
-const defaultNewMemberDraft = {
-  name: '',
-  duesAmount: '',
-  useDefaultDues: true,
-  duesExempt: false,
-  isActive: true,
+const defaultSort = {
+  orderBy: 'outstanding',
+  order: 'desc',
 }
 
-const toMemberKey = (value) => String(value || '').trim().toLowerCase()
-
-const getCurrentEstDateParts = () => {
-  const parts = EST_DATE_FORMATTER.formatToParts(new Date())
-  const values = Object.fromEntries(
-    parts.filter((part) => part.type !== 'literal').map((part) => [part.type, part.value]),
-  )
-
-  return {
-    year: Number(values.year),
-    month: Number(values.month),
-    day: Number(values.day),
+const getMemberSortValue = (member, orderBy) => {
+  switch (orderBy) {
+    case 'effectiveDuesAmount':
+      return Number(member.effectiveDuesAmount) || 0
+    case 'cyclePaid':
+      return Number(member.cyclePaid) || 0
+    case 'outstanding':
+      return Number(member.outstanding) || 0
+    case 'lifetimeDues':
+      return Number(member.contribution.dues) || 0
+    case 'lifetimeDonations':
+      return Number(member.contribution.donations) || 0
+    case 'lastPaymentDate':
+      return member.contribution.lastPaymentDate || ''
+    case 'status':
+      return member.status || ''
+    default:
+      return member.name || ''
   }
 }
 
-const createUtcDate = ({ year, month, day }) => new Date(Date.UTC(year, month - 1, day))
+const compareValues = (leftValue, rightValue) => {
+  if (typeof leftValue === 'number' && typeof rightValue === 'number') {
+    return leftValue - rightValue
+  }
 
-const toIsoDate = (date) =>
-  `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}-${String(date.getUTCDate()).padStart(2, '0')}`
-
-const addDays = (date, amount) => {
-  const nextDate = new Date(date)
-  nextDate.setUTCDate(nextDate.getUTCDate() + amount)
-  return nextDate
+  return String(leftValue).localeCompare(String(rightValue), undefined, { sensitivity: 'base' })
 }
 
-const formatCycleDate = (date) =>
-  date.toLocaleDateString(undefined, {
-    timeZone: 'UTC',
-    month: 'short',
-    day: 'numeric',
-    year: 'numeric',
-  })
+const getStatusChipProps = (status) => {
+  if (status === 'Paid') {
+    return {
+      label: 'Paid',
+      color: 'success',
+      variant: 'filled',
+    }
+  }
 
-const getMonthlyCycle = () => {
-  const { year, month } = getCurrentEstDateParts()
-  const startDate = createUtcDate({ year, month, day: 1 })
-  const endDate = new Date(Date.UTC(year, month, 0))
+  if (status === 'Partial') {
+    return {
+      label: 'Overdue',
+      color: 'error',
+      variant: 'filled',
+    }
+  }
+
+  if (status === 'Due') {
+    return {
+      label: 'Due',
+      color: 'default',
+      variant: 'outlined',
+    }
+  }
 
   return {
-    startDate: toIsoDate(startDate),
-    endDate: toIsoDate(endDate),
-    label: startDate.toLocaleDateString(undefined, { timeZone: 'UTC', month: 'long', year: 'numeric' }),
+    label: status,
+    color: 'default',
+    variant: status === 'Inactive' || status === 'No dues set' || status === 'Excluded' ? 'outlined' : 'filled',
   }
 }
-
-const getWeeklyCycle = () => {
-  const today = createUtcDate(getCurrentEstDateParts())
-  const startDate = addDays(today, -today.getUTCDay())
-  const endDate = addDays(startDate, 6)
-
-  return {
-    startDate: toIsoDate(startDate),
-    endDate: toIsoDate(endDate),
-    label: `${formatCycleDate(startDate)} - ${formatCycleDate(endDate)}`,
-  }
-}
-
-const getCycleForScheme = (dueScheme) => (dueScheme === 'weekly' ? getWeeklyCycle() : getMonthlyCycle())
 
 function DuesDashboardPage({
   selectedGuild,
   entries,
   trackedMembers,
   overviewRef,
-  rosterRef,
   historyRef,
   mutationPending,
+  canEdit = true,
   onUpdateGuildDuesSettings,
-  onCreateTrackedMember,
   onUpdateTrackedMember,
-  onDeleteTrackedMember,
   fmtGold,
 }) {
-  const [newMemberDraft, setNewMemberDraft] = useState(defaultNewMemberDraft)
+  const snapshot = useMemo(
+    () => buildMemberManagementSnapshot({ entries, trackedMembers, selectedGuild }),
+    [entries, selectedGuild, trackedMembers],
+  )
+  const [defaultDuesAmountDraft, setDefaultDuesAmountDraft] = useState(
+    String(snapshot.defaultDuesAmount),
+  )
   const [rowDrafts, setRowDrafts] = useState({})
-  const duesScheme = selectedGuild?.dueScheme === 'weekly' ? 'weekly' : 'monthly'
-  const defaultDuesAmount = Number(selectedGuild?.defaultDuesAmount) || 0
-  const [defaultDuesAmountDraft, setDefaultDuesAmountDraft] = useState(String(defaultDuesAmount))
+  const [sortConfig, setSortConfig] = useState(defaultSort)
 
   useEffect(() => {
     const syncDefaultTimeout = window.setTimeout(() => {
-      setDefaultDuesAmountDraft(String(defaultDuesAmount))
+      setDefaultDuesAmountDraft(String(snapshot.defaultDuesAmount))
     }, 0)
 
     return () => {
       window.clearTimeout(syncDefaultTimeout)
     }
-  }, [defaultDuesAmount, selectedGuild?.id])
+  }, [selectedGuild?.id, snapshot.defaultDuesAmount])
 
   useEffect(() => {
     const nextDrafts = {}
@@ -150,110 +145,32 @@ function DuesDashboardPage({
     }
   }, [trackedMembers])
 
-  const dueEntries = useMemo(
-    () => entries.filter((entry) => entry.type === 'deposit' && entry.isDue),
-    [entries],
-  )
+  const sortedMembers = useMemo(() => {
+    const direction = sortConfig.order === 'asc' ? 1 : -1
 
-  const donationEntries = useMemo(
-    () => entries.filter((entry) => entry.type === 'deposit' && entry.isDonation),
-    [entries],
-  )
+    return [...snapshot.members].sort((left, right) => {
+      const result = compareValues(
+        getMemberSortValue(left, sortConfig.orderBy),
+        getMemberSortValue(right, sortConfig.orderBy),
+      )
 
-  const lifetimeContributionTotals = useMemo(() => {
-    const totals = new Map()
-    for (const entry of entries) {
-      if (entry.type !== 'deposit') {
-        continue
+      if (result !== 0) {
+        return result * direction
       }
 
-      const key = toMemberKey(entry.user)
-      const previous = totals.get(key) || { dues: 0, donations: 0, deposits: 0, lastPaymentDate: '' }
-      totals.set(key, {
-        dues: previous.dues + (entry.isDue ? Number(entry.amount) || 0 : 0),
-        donations: previous.donations + (entry.isDonation ? Number(entry.amount) || 0 : 0),
-        deposits: previous.deposits + (Number(entry.amount) || 0),
-        lastPaymentDate: previous.lastPaymentDate > entry.date ? previous.lastPaymentDate : entry.date,
-      })
-    }
-    return totals
-  }, [entries])
+      return compareValues(left.name || '', right.name || '')
+    })
+  }, [snapshot.members, sortConfig])
 
-  const currentCycle = useMemo(() => getCycleForScheme(duesScheme), [duesScheme])
-
-  const memberRows = useMemo(
-    () =>
-      trackedMembers.map((member) => {
-        const cyclePaid = dueEntries.reduce((total, entry) => {
-          if (entry.date < currentCycle.startDate || entry.date > currentCycle.endDate) {
-            return total
-          }
-
-          return toMemberKey(entry.user) === toMemberKey(member.name)
-            ? total + (Number(entry.amount) || 0)
-            : total
-        }, 0)
-        const effectiveDuesAmount = member.useDefaultDues ? defaultDuesAmount : Number(member.duesAmount) || 0
-        const totalExpected = member.duesExempt || !member.isActive ? 0 : effectiveDuesAmount
-        const contribution = lifetimeContributionTotals.get(toMemberKey(member.name)) || {
-          dues: 0,
-          donations: 0,
-          deposits: 0,
-          lastPaymentDate: '',
-        }
-
-        const status = !member.isActive
-          ? 'Inactive'
-          : member.duesExempt
-            ? 'Excluded'
-            : totalExpected <= 0
-              ? 'No dues set'
-              : cyclePaid >= totalExpected
-                ? 'Paid'
-                : cyclePaid > 0
-                  ? 'Partial'
-                  : 'Due'
-
-        return {
-          ...member,
-          cyclePaid,
-          effectiveDuesAmount,
-          totalExpected,
-          outstanding: Math.max(totalExpected - cyclePaid, 0),
-          status,
-          contribution,
-        }
-      }),
-    [currentCycle.endDate, currentCycle.startDate, defaultDuesAmount, dueEntries, lifetimeContributionTotals, trackedMembers],
-  )
-
-  const summary = useMemo(
-    () => ({
-      expected: memberRows.reduce(
-        (total, member) => total + (member.isActive && !member.duesExempt ? member.totalExpected : 0),
-        0,
-      ),
-      collected: memberRows.reduce((total, member) => total + member.cyclePaid, 0),
-      paidCount: memberRows.filter((member) => member.status === 'Paid').length,
-      partialCount: memberRows.filter((member) => member.status === 'Partial').length,
-      dueCount: memberRows.filter((member) => member.status === 'Due').length,
-      excludedCount: memberRows.filter((member) => member.status === 'Excluded').length,
-    }),
-    [memberRows],
-  )
-
-  const recentDueHistory = useMemo(
-    () => [...dueEntries].sort((left, right) => right.date.localeCompare(left.date)).slice(0, 8),
-    [dueEntries],
-  )
-
-  const recentDonationHistory = useMemo(
-    () => [...donationEntries].sort((left, right) => right.date.localeCompare(left.date)).slice(0, 8),
-    [donationEntries],
-  )
+  const handleSort = (orderBy) => {
+    setSortConfig((prev) => ({
+      orderBy,
+      order: prev.orderBy === orderBy && prev.order === 'asc' ? 'desc' : 'asc',
+    }))
+  }
 
   if (!selectedGuild) {
-    return <Alert severity="info">Choose a guild before opening member management.</Alert>
+    return <Alert severity="info">Select a guild to view dues.</Alert>
   }
 
   return (
@@ -267,10 +184,15 @@ function DuesDashboardPage({
             alignItems={{ xs: 'stretch', md: 'center' }}
           >
             <Box>
-              <Typography variant="h6">Member Management</Typography>
+              <Typography variant="h6">Dues Dashboard</Typography>
               <Typography variant="body2" color="text.secondary">
-                Manage shared dues settings, automated calendar resets, and recurring member activity for {selectedGuild.name}.
+                Manage dues settings and track payments for {selectedGuild.name}.
               </Typography>
+              {!canEdit && (
+                <Alert severity="info" sx={{ mt: 1 }}>
+                  Viewer access is read-only. Only admins and owners can update dues settings.
+                </Alert>
+              )}
             </Box>
             <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
               <FormControl sx={{ minWidth: 180 }}>
@@ -278,8 +200,8 @@ function DuesDashboardPage({
                 <Select
                   labelId="guild-due-scheme-label"
                   label="Dues scheme"
-                  value={duesScheme}
-                  disabled={mutationPending}
+                  value={snapshot.duesScheme}
+                  disabled={mutationPending || !canEdit}
                   onChange={(event) => {
                     void onUpdateGuildDuesSettings({ dueScheme: event.target.value })
                   }}
@@ -292,12 +214,13 @@ function DuesDashboardPage({
                 label="Default dues amount"
                 type="number"
                 value={defaultDuesAmountDraft}
+                disabled={!canEdit}
                 onChange={(event) => setDefaultDuesAmountDraft(event.target.value)}
                 sx={{ minWidth: { xs: '100%', sm: 210 } }}
               />
               <Button
                 variant="outlined"
-                disabled={mutationPending}
+                disabled={mutationPending || !canEdit}
                 onClick={() =>
                   void onUpdateGuildDuesSettings({
                     defaultDuesAmount: defaultDuesAmountDraft,
@@ -309,127 +232,121 @@ function DuesDashboardPage({
             </Stack>
           </Stack>
           <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5} sx={{ mt: 2 }} useFlexGap flexWrap="wrap">
-            <Chip label={`Scheme: ${duesScheme === 'weekly' ? 'Weekly' : 'Monthly'}`} variant="outlined" />
-            <Chip label={`Current cycle: ${currentCycle.label}`} color="primary" variant="outlined" />
-            <Chip label={`Guild default: ${fmtGold(defaultDuesAmount)}`} variant="outlined" />
-            <Chip label={`Expected: ${fmtGold(summary.expected)}`} />
-            <Chip label={`Collected: ${fmtGold(summary.collected)}`} />
-            <Chip label={`Outstanding: ${fmtGold(Math.max(summary.expected - summary.collected, 0))}`} />
-            <Chip label={`Paid: ${summary.paidCount}`} color="success" variant="outlined" />
-            <Chip label={`Partial: ${summary.partialCount}`} color="warning" variant="outlined" />
-            <Chip label={`Due: ${summary.dueCount}`} color="error" variant="outlined" />
-            <Chip label={`Excluded: ${summary.excludedCount}`} variant="outlined" />
+            <Chip label={`Scheme: ${snapshot.duesScheme === 'weekly' ? 'Weekly' : 'Monthly'}`} variant="outlined" />
+            <Chip label={`Current cycle: ${snapshot.currentCycle.label}`} color="primary" variant="outlined" />
+            <Chip label={`Guild default: ${fmtGold(snapshot.defaultDuesAmount)}`} variant="outlined" />
+            <Chip label={`Expected: ${fmtGold(snapshot.summary.expected)}`} />
+            <Chip label={`Collected: ${fmtGold(snapshot.summary.collected)}`} />
+            <Chip
+              label={`Outstanding: ${fmtGold(Math.max(snapshot.summary.expected - snapshot.summary.collected, 0))}`}
+            />
+            <Chip label={`Paid: ${snapshot.summary.paidCount}`} color="success" variant="outlined" />
+            <Chip label={`Partial: ${snapshot.summary.partialCount}`} color="warning" variant="outlined" />
+            <Chip label={`Due: ${snapshot.summary.dueCount}`} color="error" variant="outlined" />
+            <Chip label={`Excluded: ${snapshot.summary.excludedCount}`} variant="outlined" />
           </Stack>
           <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
-            Weekly dues reset automatically at the start of Sunday in Eastern Time. Monthly dues reset automatically on the first day of each month in Eastern Time.
+            Weekly dues reset each Sunday in Eastern Time. Monthly dues reset on the first of each month.
           </Typography>
         </CardContent>
       </Card>
 
-      <Card ref={rosterRef}>
+      <Card>
         <CardContent>
           <Typography variant="h6" gutterBottom>
-            Guild Member Roster
+            Member Dues Tracking
           </Typography>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-            Add tracked members to this guild, use the shared {duesScheme} dues scheme, and mark anyone who is permanently excluded from owing dues.
+            Review the current cycle, sort the roster, and switch members between default and custom dues.
           </Typography>
-          <Stack direction={{ xs: 'column', md: 'row' }} spacing={1.5} sx={{ mb: 2 }}>
-            <TextField
-              fullWidth
-              label="Member name"
-              value={newMemberDraft.name}
-              onChange={(event) =>
-                setNewMemberDraft((prev) => ({ ...prev, name: event.target.value }))
-              }
-            />
-            <TextField
-              label="Custom dues amount"
-              type="number"
-              value={newMemberDraft.duesAmount}
-              onChange={(event) =>
-                setNewMemberDraft((prev) => ({ ...prev, duesAmount: event.target.value }))
-              }
-              disabled={newMemberDraft.duesExempt || newMemberDraft.useDefaultDues}
-              sx={{ minWidth: 160 }}
-            />
-            <FormControlLabel
-              control={
-                <Checkbox
-                  checked={newMemberDraft.useDefaultDues}
-                  onChange={(event) =>
-                    setNewMemberDraft((prev) => ({ ...prev, useDefaultDues: event.target.checked }))
-                  }
-                />
-              }
-              label="Use guild default dues"
-            />
-            <FormControlLabel
-              control={
-                <Checkbox
-                  checked={newMemberDraft.duesExempt}
-                  onChange={(event) =>
-                    setNewMemberDraft((prev) => ({ ...prev, duesExempt: event.target.checked }))
-                  }
-                />
-              }
-              label="Permanently excluded from dues"
-            />
-            <FormControlLabel
-              control={
-                <Checkbox
-                  checked={newMemberDraft.isActive}
-                  onChange={(event) =>
-                    setNewMemberDraft((prev) => ({ ...prev, isActive: event.target.checked }))
-                  }
-                />
-              }
-              label="Active"
-            />
-            <Button
-              variant="contained"
-              disabled={mutationPending}
-              onClick={async () => {
-                const wasSaved = await onCreateTrackedMember({
-                  name: newMemberDraft.name,
-                  duesAmount: newMemberDraft.duesAmount,
-                  useDefaultDues: newMemberDraft.useDefaultDues,
-                  duesExempt: newMemberDraft.duesExempt,
-                  isActive: newMemberDraft.isActive,
-                })
-
-                if (wasSaved) {
-                  setNewMemberDraft(defaultNewMemberDraft)
-                }
-              }}
-            >
-              Add member
-            </Button>
-          </Stack>
-
           <TableContainer sx={{ overflowX: 'auto' }}>
-            <Table size="small" sx={{ minWidth: 840 }}>
+            <Table size="small" sx={{ minWidth: 1120 }}>
               <TableHead>
                 <TableRow>
-                  <TableCell>Member</TableCell>
-                  <TableCell align="right">Dues amount</TableCell>
-                  <TableCell>Status</TableCell>
-                  <TableCell align="right">This cycle</TableCell>
-                  <TableCell align="right">Outstanding</TableCell>
-                  <TableCell align="right">Lifetime dues</TableCell>
-                  <TableCell align="right">Lifetime donations</TableCell>
+                  <TableCell>
+                    <TableSortLabel
+                      active={sortConfig.orderBy === 'name'}
+                      direction={sortConfig.orderBy === 'name' ? sortConfig.order : 'asc'}
+                      onClick={() => handleSort('name')}
+                    >
+                      Member
+                    </TableSortLabel>
+                  </TableCell>
+                  <TableCell align="right">
+                    <TableSortLabel
+                      active={sortConfig.orderBy === 'effectiveDuesAmount'}
+                      direction={sortConfig.orderBy === 'effectiveDuesAmount' ? sortConfig.order : 'asc'}
+                      onClick={() => handleSort('effectiveDuesAmount')}
+                    >
+                      Dues amount
+                    </TableSortLabel>
+                  </TableCell>
+                  <TableCell>
+                    <TableSortLabel
+                      active={sortConfig.orderBy === 'status'}
+                      direction={sortConfig.orderBy === 'status' ? sortConfig.order : 'asc'}
+                      onClick={() => handleSort('status')}
+                    >
+                      Status
+                    </TableSortLabel>
+                  </TableCell>
+                  <TableCell align="right">
+                    <TableSortLabel
+                      active={sortConfig.orderBy === 'cyclePaid'}
+                      direction={sortConfig.orderBy === 'cyclePaid' ? sortConfig.order : 'asc'}
+                      onClick={() => handleSort('cyclePaid')}
+                    >
+                      This cycle
+                    </TableSortLabel>
+                  </TableCell>
+                  <TableCell align="right">
+                    <TableSortLabel
+                      active={sortConfig.orderBy === 'outstanding'}
+                      direction={sortConfig.orderBy === 'outstanding' ? sortConfig.order : 'asc'}
+                      onClick={() => handleSort('outstanding')}
+                    >
+                      Outstanding
+                    </TableSortLabel>
+                  </TableCell>
+                  <TableCell align="right">
+                    <TableSortLabel
+                      active={sortConfig.orderBy === 'lifetimeDues'}
+                      direction={sortConfig.orderBy === 'lifetimeDues' ? sortConfig.order : 'asc'}
+                      onClick={() => handleSort('lifetimeDues')}
+                    >
+                      Lifetime dues
+                    </TableSortLabel>
+                  </TableCell>
+                  <TableCell align="right">
+                    <TableSortLabel
+                      active={sortConfig.orderBy === 'lifetimeDonations'}
+                      direction={sortConfig.orderBy === 'lifetimeDonations' ? sortConfig.order : 'asc'}
+                      onClick={() => handleSort('lifetimeDonations')}
+                    >
+                      Lifetime donations
+                    </TableSortLabel>
+                  </TableCell>
+                  <TableCell>
+                    <TableSortLabel
+                      active={sortConfig.orderBy === 'lastPaymentDate'}
+                      direction={sortConfig.orderBy === 'lastPaymentDate' ? sortConfig.order : 'asc'}
+                      onClick={() => handleSort('lastPaymentDate')}
+                    >
+                      Last payment
+                    </TableSortLabel>
+                  </TableCell>
                   <TableCell align="right">Actions</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
-                {memberRows.length === 0 ? (
+                {sortedMembers.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={8} align="center">
+                    <TableCell colSpan={9} align="center">
                       No tracked members yet.
                     </TableCell>
                   </TableRow>
                 ) : (
-                  memberRows.map((member) => {
+                  sortedMembers.map((member) => {
                     const rowDraft = rowDrafts[member.id] || {
                       name: member.name,
                       duesAmount: String(member.duesAmount ?? 0),
@@ -437,33 +354,28 @@ function DuesDashboardPage({
                       duesExempt: Boolean(member.duesExempt),
                       isActive: Boolean(member.isActive),
                     }
+                    const statusChip = getStatusChipProps(member.status)
 
                     return (
                       <TableRow key={member.id}>
                         <TableCell>
-                          <Stack spacing={1}>
-                            <TextField
-                              size="small"
-                              value={rowDraft.name}
-                              onChange={(event) =>
-                                setRowDrafts((prev) => ({
-                                  ...prev,
-                                  [member.id]: { ...rowDraft, name: event.target.value },
-                                }))
-                              }
-                            />
-                            <Typography variant="caption" color="text.secondary">
-                              Last payment: {member.contribution.lastPaymentDate || 'No deposits yet'}
-                            </Typography>
+                          <Stack spacing={0.5}>
+                            <Typography variant="body2">{member.name}</Typography>
+                            {!member.isActive && (
+                              <Typography variant="caption" color="text.secondary">
+                                Inactive roster member
+                              </Typography>
+                            )}
                           </Stack>
                         </TableCell>
                         <TableCell align="right">
                           <Stack spacing={1} alignItems="flex-end">
                             <TextField
                               size="small"
+                              label="Dues amount"
                               type="number"
                               value={rowDraft.duesAmount}
-                              disabled={rowDraft.duesExempt || rowDraft.useDefaultDues}
+                              disabled={!canEdit || rowDraft.duesExempt || rowDraft.useDefaultDues}
                               onChange={(event) =>
                                 setRowDrafts((prev) => ({
                                   ...prev,
@@ -481,13 +393,13 @@ function DuesDashboardPage({
                           <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap">
                             <Chip
                               size="small"
-                              label={member.status}
-                              color={member.status === 'Paid' ? 'success' : member.status === 'Partial' ? 'warning' : member.status === 'Due' ? 'error' : 'default'}
-                              variant={member.status === 'Inactive' || member.status === 'No dues set' || member.status === 'Excluded' ? 'outlined' : 'filled'}
+                              label={statusChip.label}
+                              color={statusChip.color}
+                              variant={statusChip.variant}
                             />
                             <Chip
                               size="small"
-                              label={rowDraft.duesExempt ? 'No dues required' : rowDraft.useDefaultDues ? `Uses guild default • ${fmtGold(defaultDuesAmount)}` : 'Uses custom dues'}
+                              label={rowDraft.duesExempt ? 'No dues required' : rowDraft.useDefaultDues ? `Uses guild default • ${fmtGold(snapshot.defaultDuesAmount)}` : 'Uses custom dues'}
                               variant="outlined"
                             />
                             <FormControlLabel
@@ -495,6 +407,7 @@ function DuesDashboardPage({
                               control={
                                 <Checkbox
                                   checked={rowDraft.useDefaultDues}
+                                  disabled={!canEdit}
                                   onChange={(event) =>
                                     setRowDrafts((prev) => ({
                                       ...prev,
@@ -510,6 +423,7 @@ function DuesDashboardPage({
                               control={
                                 <Checkbox
                                   checked={rowDraft.duesExempt}
+                                  disabled={!canEdit}
                                   onChange={(event) =>
                                     setRowDrafts((prev) => ({
                                       ...prev,
@@ -520,54 +434,30 @@ function DuesDashboardPage({
                               }
                               label="Excluded from dues"
                             />
-                            <FormControlLabel
-                              sx={{ mr: 0 }}
-                              control={
-                                <Checkbox
-                                  checked={rowDraft.isActive}
-                                  onChange={(event) =>
-                                    setRowDrafts((prev) => ({
-                                      ...prev,
-                                      [member.id]: { ...rowDraft, isActive: event.target.checked },
-                                    }))
-                                  }
-                                />
-                              }
-                              label="Active"
-                            />
                           </Stack>
                         </TableCell>
                         <TableCell align="right">{fmtGold(member.cyclePaid)}</TableCell>
                         <TableCell align="right">{fmtGold(member.outstanding)}</TableCell>
                         <TableCell align="right">{fmtGold(member.contribution.dues)}</TableCell>
                         <TableCell align="right">{fmtGold(member.contribution.donations)}</TableCell>
+                        <TableCell>{formatDisplayDate(member.contribution.lastPaymentDate) || 'No deposits yet'}</TableCell>
                         <TableCell align="right">
-                          <Stack direction="row" spacing={1} justifyContent="flex-end">
-                            <Button
-                              size="small"
-                              variant="outlined"
-                              disabled={mutationPending}
-                              onClick={() =>
-                                onUpdateTrackedMember(member.id, {
-                                  name: rowDraft.name,
-                                  duesAmount: rowDraft.duesAmount,
-                                  useDefaultDues: rowDraft.useDefaultDues,
-                                  duesExempt: rowDraft.duesExempt,
-                                  isActive: rowDraft.isActive,
-                                })
-                              }
-                            >
-                              Save
-                            </Button>
-                            <Button
-                              size="small"
-                              color="error"
-                              disabled={mutationPending}
-                              onClick={() => onDeleteTrackedMember(member)}
-                            >
-                              Delete
-                            </Button>
-                          </Stack>
+                          <Button
+                            size="small"
+                            variant="outlined"
+                            disabled={mutationPending || !canEdit}
+                            onClick={() =>
+                              onUpdateTrackedMember(member.id, {
+                                name: rowDraft.name,
+                                duesAmount: rowDraft.duesAmount,
+                                useDefaultDues: rowDraft.useDefaultDues,
+                                duesExempt: rowDraft.duesExempt,
+                                isActive: rowDraft.isActive,
+                              })
+                            }
+                          >
+                            Save dues
+                          </Button>
                         </TableCell>
                       </TableRow>
                     )
@@ -596,16 +486,16 @@ function DuesDashboardPage({
                   </TableRow>
                 </TableHead>
                 <TableBody>
-                  {recentDueHistory.length === 0 ? (
+                  {snapshot.dueHistory.length === 0 ? (
                     <TableRow>
                       <TableCell colSpan={4} align="center">
                         No dues payments recorded yet.
                       </TableCell>
                     </TableRow>
                   ) : (
-                    recentDueHistory.map((entry) => (
+                    snapshot.dueHistory.map((entry) => (
                       <TableRow key={entry.id}>
-                        <TableCell>{entry.date}</TableCell>
+                        <TableCell>{formatDisplayDate(entry.date)}</TableCell>
                         <TableCell>{entry.user || 'Unassigned member'}</TableCell>
                         <TableCell align="right">{fmtGold(entry.amount)}</TableCell>
                         <TableCell>{entry.notes || '—'}</TableCell>
@@ -634,16 +524,16 @@ function DuesDashboardPage({
                   </TableRow>
                 </TableHead>
                 <TableBody>
-                  {recentDonationHistory.length === 0 ? (
+                  {snapshot.donationHistory.length === 0 ? (
                     <TableRow>
                       <TableCell colSpan={4} align="center">
                         No donation deposits recorded yet.
                       </TableCell>
                     </TableRow>
                   ) : (
-                    recentDonationHistory.map((entry) => (
+                    snapshot.donationHistory.map((entry) => (
                       <TableRow key={entry.id}>
-                        <TableCell>{entry.date}</TableCell>
+                        <TableCell>{formatDisplayDate(entry.date)}</TableCell>
                         <TableCell>{entry.user || 'Unassigned member'}</TableCell>
                         <TableCell align="right">{fmtGold(entry.amount)}</TableCell>
                         <TableCell>{entry.notes || '—'}</TableCell>

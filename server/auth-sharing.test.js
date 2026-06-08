@@ -267,7 +267,7 @@ describe('auth and guild sharing flows', () => {
     )
   })
 
-  it('supports guild invite, join, leave, and owner removal flows', async () => {
+  it('supports viewer, admin, and owner guild roles', async () => {
     const owner = new SessionClient()
     const member = new SessionClient()
     const removedMember = new SessionClient()
@@ -308,10 +308,16 @@ describe('auth and guild sharing flows', () => {
       inviteRedeem.payload.user.guilds.some((guild) => guild.id === guildId),
       true,
     )
+    const memberGuildAfterJoin = inviteRedeem.payload.user.guilds.find((guild) => guild.id === guildId)
+    assert.equal(memberGuildAfterJoin.role, 'viewer')
+    assert.equal(memberGuildAfterJoin.canEdit, false)
+    assert.equal(memberGuildAfterJoin.canManagePermissions, false)
 
     const ownerSessionAfterJoin = await owner.request('/api/session')
     const ownerGuildAfterJoin = ownerSessionAfterJoin.payload.user.guilds.find((guild) => guild.id === guildId)
     assert.equal(ownerGuildAfterJoin.members.some((guildMember) => guildMember.username === 'shared_member'), true)
+    const sharedMemberRecord = ownerGuildAfterJoin.members.find((guildMember) => guildMember.username === 'shared_member')
+    assert.equal(sharedMemberRecord.role, 'viewer')
 
     const ownerAuditLogs = await owner.request(`/api/guilds/${guildId}/audit-logs`)
     assert.equal(ownerAuditLogs.response.status, 200)
@@ -324,8 +330,45 @@ describe('auth and guild sharing flows', () => {
     assert.equal(typeof createAuditRow.createdAt, 'string')
 
     const memberAuditLogs = await member.request(`/api/guilds/${guildId}/audit-logs`)
-    assert.equal(memberAuditLogs.response.status, 403)
-    assert.equal(memberAuditLogs.payload.error, 'Only guild owners can view this audit history.')
+    assert.equal(memberAuditLogs.response.status, 200)
+
+    const viewerEntryCreate = await member.request(`/api/guilds/${guildId}/entries`, {
+      method: 'POST',
+      body: { type: 'deposit', amount: 1000, date: '2026-06-01', user: 'shared_member', notes: 'Viewer blocked' },
+    })
+    assert.equal(viewerEntryCreate.response.status, 403)
+    assert.equal(
+      viewerEntryCreate.payload.error,
+      'You have view-only access to this guild. Ask the owner to grant admin access before making changes.',
+    )
+
+    const promoteViewer = await owner.request(`/api/guilds/${guildId}/members/${sharedMemberRecord.userId}`, {
+      method: 'PATCH',
+      body: { role: 'admin' },
+    })
+    assert.equal(promoteViewer.response.status, 200)
+    const promotedGuild = promoteViewer.payload.user.guilds.find((guild) => guild.id === guildId)
+    assert.equal(
+      promotedGuild.members.find((guildMember) => guildMember.username === 'shared_member')?.role,
+      'admin',
+    )
+
+    const adminEntryCreate = await member.request(`/api/guilds/${guildId}/entries`, {
+      method: 'POST',
+      body: { type: 'deposit', amount: 1000, date: '2026-06-01', user: 'shared_member', notes: 'Admin edit' },
+    })
+    assert.equal(adminEntryCreate.response.status, 201)
+
+    const adminDeleteGuild = await member.request(`/api/guilds/${guildId}`, {
+      method: 'DELETE',
+    })
+    assert.equal(adminDeleteGuild.response.status, 403)
+
+    const adminInviteCreate = await member.request(`/api/guilds/${guildId}/invites`, {
+      method: 'POST',
+      body: { singleUse: false, expiresInHours: 24 },
+    })
+    assert.equal(adminInviteCreate.response.status, 403)
 
     const leaveResult = await member.request(`/api/guilds/${guildId}/membership`, {
       method: 'DELETE',
@@ -349,6 +392,8 @@ describe('auth and guild sharing flows', () => {
     })
     assert.equal(secondRedeem.response.status, 200)
     assert.equal(secondRedeem.payload.user.guilds.some((guild) => guild.id === guildId), true)
+    const removedMemberGuild = secondRedeem.payload.user.guilds.find((guild) => guild.id === guildId)
+    assert.equal(removedMemberGuild.role, 'viewer')
 
     const ownerSessionBeforeRemoval = await owner.request('/api/session')
     const ownerGuildBeforeRemoval = ownerSessionBeforeRemoval.payload.user.guilds.find((guild) => guild.id === guildId)
@@ -379,6 +424,7 @@ describe('auth and guild sharing flows', () => {
     assert.equal(actionNames.includes('guild.create'), true)
     assert.equal(actionNames.includes('guild.invite_create'), true)
     assert.equal(actionNames.includes('guild.invite_redeem'), true)
+    assert.equal(actionNames.includes('guild.member_role_update'), true)
     assert.equal(actionNames.includes('guild.leave'), true)
     assert.equal(actionNames.includes('guild.member_remove'), true)
   })

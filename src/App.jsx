@@ -68,6 +68,7 @@ import {
   renameGuild,
   selectGuild,
   signUp,
+  updateGuildMemberRole as updateGuildMemberRoleRequest,
   updateGuildDuesSettings,
   updateRecoveryEmail,
   updateEntryInGuild,
@@ -80,17 +81,22 @@ import DeleteAccountDialog from './components/DeleteAccountDialog'
 import DuesDashboardPage from './components/DuesDashboardPage'
 import GuildAccessDialog from './components/GuildAccessDialog'
 import GuildProfilesDrawer from './components/GuildProfilesDrawer'
+import MemberManagementPage from './components/MemberManagementPage'
 import PasswordResetConfirmDialog from './components/PasswordResetConfirmDialog'
 import PasswordResetRequestDialog from './components/PasswordResetRequestDialog'
 import PieBreakdownChart from './components/PieBreakdownChart'
 import SettingsDialog from './components/SettingsDialog'
 import Graph from './components/Graph'
 import TutorialOverlay from './components/TutorialOverlay'
-import { buildMemberManagementSnapshot, exportReportBundle } from './reportExports'
+import { exportReportBundle } from './reportExports'
+import { formatDisplayDate } from './utils/dateFormatting'
+import { applyLedgerFilters, defaultLedgerFilters, getLedgerSavedViewScope, hasActiveLedgerFilters } from './utils/ledgerFilters'
+import { buildMemberManagementSnapshot } from './utils/memberDues'
 import './App.css'
 
 const LEGACY_STORAGE_KEY = 'eso-guild-bank-management-v1'
 const LEGACY_SESSION_USER_KEY = 'eso-guild-bank-session-user'
+const LEDGER_SAVED_VIEWS_STORAGE_KEY = 'eso-ledger-saved-views-v1'
 
 const todayString = () => new Date().toISOString().slice(0, 10)
 
@@ -269,19 +275,6 @@ const dayToIso = (date) =>
     date.getDate(),
   ).padStart(2, '0')}`
 
-const formatDisplayDate = (isoDate) => {
-  if (!isoDate) {
-    return ''
-  }
-
-  const [year, month, day] = isoDate.split('-')
-  if (!year || !month || !day) {
-    return isoDate
-  }
-
-  return `${month}/${day}/${year}`
-}
-
 const formatDisplayDateRange = (startDate, endDate) =>
   startDate === endDate
     ? formatDisplayDate(startDate)
@@ -313,6 +306,23 @@ const computeTotals = (entries, filter) =>
     },
     { deposit: 0, withdrawal: 0, salesTax: 0 },
   )
+
+const computeEntryCount = (entries, filter) =>
+  entries.reduce((count, entry) => (filter(entry) ? count + 1 : count), 0)
+
+const readLedgerSavedViews = () => {
+  try {
+    const raw = window.localStorage.getItem(LEDGER_SAVED_VIEWS_STORAGE_KEY)
+    if (!raw) {
+      return {}
+    }
+
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch {
+    return {}
+  }
+}
 
 const computeTopDonors = (entries, filter) => {
   const depositsByUser = entries.reduce((totals, entry) => {
@@ -392,6 +402,7 @@ const buildStatisticsRows = (entries, statisticsRange) => {
     dailyRows.push({
       label: formatDisplayDate(dayIso),
       totals: computeTotals(entries, (entry) => entry.date === dayIso),
+      entryCount: computeEntryCount(entries, (entry) => entry.date === dayIso),
       topDonors: computeTopDonors(entries, (entry) => entry.date === dayIso),
     })
   }
@@ -407,6 +418,7 @@ const buildStatisticsRows = (entries, statisticsRange) => {
     weeklyRows.push({
       label: formatDisplayDateRange(weekStartIso, weekEndIso),
       totals: computeTotals(entries, (entry) => entry.date >= weekStartIso && entry.date <= weekEndIso),
+      entryCount: computeEntryCount(entries, (entry) => entry.date >= weekStartIso && entry.date <= weekEndIso),
       topDonors: computeTopDonors(entries, (entry) => entry.date >= weekStartIso && entry.date <= weekEndIso),
     })
   }
@@ -422,6 +434,7 @@ const buildStatisticsRows = (entries, statisticsRange) => {
     monthlyRows.push({
       label: formatDisplayDateRange(monthStartIso, monthEndIso),
       totals: computeTotals(entries, (entry) => entry.date >= monthStartIso && entry.date <= monthEndIso),
+      entryCount: computeEntryCount(entries, (entry) => entry.date >= monthStartIso && entry.date <= monthEndIso),
       topDonors: computeTopDonors(entries, (entry) => entry.date >= monthStartIso && entry.date <= monthEndIso),
     })
   }
@@ -431,6 +444,7 @@ const buildStatisticsRows = (entries, statisticsRange) => {
     {
       label: formatDisplayDateRange(startDate, endDate),
       totals: computeTotals(entries, (entry) => entry.date >= startDate && entry.date <= endDate),
+      entryCount: computeEntryCount(entries, (entry) => entry.date >= startDate && entry.date <= endDate),
       topDonors: computeTopDonors(entries, (entry) => entry.date >= startDate && entry.date <= endDate),
     },
   ])
@@ -706,9 +720,10 @@ function App() {
   const statisticsRef = useRef(null)
   const graphRef = useRef(null)
   const logEntriesRef = useRef(null)
-  const memberManagementOverviewRef = useRef(null)
+  const duesOverviewRef = useRef(null)
+  const duesHistoryRef = useRef(null)
+  const memberManagementControlsRef = useRef(null)
   const memberManagementRosterRef = useRef(null)
-  const memberManagementHistoryRef = useRef(null)
   const guildDrawerRef = useRef(null)
 
   const isMobileLayout = useMediaQuery(theme.breakpoints.down('md'))
@@ -742,6 +757,9 @@ function App() {
   const [entryPageState, setEntryPageState] = useState({ scope: '', page: 1 })
   const [entriesPerPage, setEntriesPerPage] = useState(entryPageSizeOptions[0])
   const [entrySort, setEntrySort] = useState({ column: 'date', direction: 'desc' })
+  const [ledgerFilters, setLedgerFilters] = useState(() => ({ ...defaultLedgerFilters }))
+  const [savedLedgerViews, setSavedLedgerViews] = useState(readLedgerSavedViews)
+  const [selectedSavedViewId, setSelectedSavedViewId] = useState('')
   const [statisticsRange, setStatisticsRange] = useState(createTodayStatisticsRange)
   const [collapsedStatisticsSections, setCollapsedStatisticsSections] = useState(
     createCollapsedStatisticsSections,
@@ -774,6 +792,10 @@ function App() {
     currentUser?.guilds?.find((guild) => guild.id === currentUser.selectedGuildId) ?? null
   const guildAccessGuild =
     currentUser?.guilds?.find((guild) => guild.id === guildAccessGuildId) ?? null
+  const ledgerSavedViewScope = getLedgerSavedViewScope({ sessionUser, guildId: selectedGuild?.id })
+  const scopedSavedLedgerViews = savedLedgerViews[ledgerSavedViewScope] ?? []
+  const canEditSelectedGuild = !sessionUser || Boolean(selectedGuild?.canEdit)
+  const canManageSelectedGuildPermissions = Boolean(selectedGuild?.canManagePermissions)
 
   const activeEntries = useMemo(
     () => (sessionUser ? selectedGuild?.entries ?? [] : guestState.entries),
@@ -787,11 +809,29 @@ function App() {
     () => buildMemberSuggestions(trackedMembers, activeEntries),
     [activeEntries, trackedMembers],
   )
+  const filteredEntries = useMemo(
+    () =>
+      applyLedgerFilters(activeEntries, {
+        ...ledgerFilters,
+        startDate: statisticsRange.startDate,
+        endDate: statisticsRange.endDate,
+      }),
+    [activeEntries, ledgerFilters, statisticsRange.endDate, statisticsRange.startDate],
+  )
+  const hasActiveLedgerViewFilters = useMemo(
+    () =>
+      hasActiveLedgerFilters({
+        ...ledgerFilters,
+        startDate: statisticsRange.startDate,
+        endDate: statisticsRange.endDate,
+      }),
+    [ledgerFilters, statisticsRange.endDate, statisticsRange.startDate],
+  )
   const exportScopeOptions = useMemo(() => {
     const options = [{ value: 'ledger', label: 'Ledger report' }]
 
     if (sessionUser && selectedGuild) {
-      options.push({ value: 'member-management', label: 'Member management report' })
+      options.push({ value: 'member-management', label: 'Members and dues report' })
       options.push({ value: 'full', label: 'Full combined report' })
     }
 
@@ -807,13 +847,13 @@ function App() {
       ? {
           title: isMobileLayout ? 'Guild Tools Menu' : 'Guild Profiles',
           body: isMobileLayout
-            ? 'Open this menu to switch guilds, create a new guild, join shared guilds, and manage member access from one place.'
-            : 'This sidebar is where guild management lives. You can create guilds, switch between them, invite members, and manage shared access here.',
+            ? 'Open this menu to switch guilds, create one, join shared guilds, and manage access.'
+            : 'Use this sidebar to switch guilds, invite members, and manage shared access.',
           targetRef: isMobileLayout ? mobileGuildMenuRef : guildDrawerRef,
         }
       : {
           title: 'Sign In When You Are Ready',
-          body: 'Guest mode works for quick testing, but accounts let you save data to the server, manage shared guilds, and recover access later.',
+          body: 'Guest mode is fine for a quick test, but an account saves your data and lets you recover access later.',
           targetRef: authActionRef,
         }
 
@@ -822,39 +862,47 @@ function App() {
         ? [
             {
               title: 'Review Shared Dues Settings',
-              body: 'This overview controls the shared weekly or monthly scheme, the guild default dues amount, and the current cycle totals for the roster.',
-              targetRef: memberManagementOverviewRef,
-            },
-            {
-              title: 'Manage the Member Roster',
-              body: 'Add tracked members here, mark permanent exclusions, toggle active status, and choose whether someone follows the guild default or a custom dues amount.',
-              targetRef: memberManagementRosterRef,
+              body: 'Set the guild dues schedule, update the default amount, and review this cycle at a glance.',
+              targetRef: duesOverviewRef,
             },
             {
               title: 'Check Payment History',
-              body: 'Use these recent dues and donation tables to verify who has paid, spot missing contributions, and review recent activity without leaving the page.',
-              targetRef: memberManagementHistoryRef,
+              body: 'Review recent dues and donations to see who paid and what is still missing.',
+              targetRef: duesHistoryRef,
             },
           ]
-        : [
+        : currentPage === 'member-management'
+          ? [
+              {
+                title: 'Add And Update Members',
+                body: 'Add members here, rename them, and keep the active roster up to date.',
+                targetRef: memberManagementControlsRef,
+              },
+              {
+                title: 'Sort The Directory',
+                body: 'Use the roster table to review names, update status, and remove members when needed.',
+                targetRef: memberManagementRosterRef,
+              },
+            ]
+          : [
             {
               title: 'Add Entries Quickly',
-              body: 'Use this form to record deposits, withdrawals, and sales tax. Assign entries to tracked guild members with autofill suggestions, then classify deposit activity as donations or dues.',
+              body: 'Record deposits, withdrawals, and sales tax here. You can also tag deposits as dues or donations.',
               targetRef: addEntryRef,
             },
             {
               title: 'Read the Totals',
-              body: 'The statistics table rolls entries into overall, monthly, weekly, and daily views so you can spot changes without scanning the full log.',
+              body: 'The stats table groups your totals by overall, monthly, weekly, and daily activity.',
               targetRef: statisticsRef,
             },
             {
               title: 'Explore the Charts',
-              body: 'The graph area gives you toggleable trend lines plus a breakdown chart for deposits and withdrawals. Use the date range above to focus the view.',
+              body: 'Use the charts to spot trends and filter the view by date range.',
               targetRef: graphRef,
             },
             {
               title: 'Review the Entry Log',
-              body: 'The log is your detailed audit trail. Sort it, page through it, and edit or delete individual entries whenever records need correction.',
+              body: 'Browse the full log, sort it, and update or remove entries when needed.',
               targetRef: logEntriesRef,
             },
           ]
@@ -862,15 +910,15 @@ function App() {
     return [
       {
         title: 'Welcome to the Guild Ledger',
-        body: 'This walkthrough highlights the main tools for logging gold movement, reviewing trends, and managing guild spaces. You can skip it at any time.',
+        body: 'This walkthrough highlights the main tools for tracking gold, reviewing trends, and managing your guild. You can skip it anytime.',
         targetRef: heroRef,
       },
       accountStep,
       ...(sessionUser
         ? [
             {
-              title: 'Switch Between Ledger And Member Management',
-              body: 'Use these tabs to move between transaction tracking and member management. The walkthrough will continue with the tools for whichever page is currently open.',
+              title: 'Switch Between Pages',
+              body: 'Use these tabs to switch between the ledger, dues, and member roster. The walkthrough follows the page you have open.',
               targetRef: pageTabsRef,
             },
           ]
@@ -915,19 +963,25 @@ function App() {
   }
 
   const openExportDialog = () => {
-    const defaultScope = currentPage === 'dues' && sessionUser && selectedGuild ? 'member-management' : 'ledger'
+    const defaultScope = currentPage !== 'ledger' && sessionUser && selectedGuild ? 'member-management' : 'ledger'
     setExportScope(defaultScope)
     setExportFormat('csv')
     setExportDialogOpen(true)
   }
 
   useEffect(() => {
-    if (!sessionUser || !selectedGuild?.id) {
-      return
-    }
-
     setStatisticsRange(createTodayStatisticsRange())
+    setLedgerFilters({ ...defaultLedgerFilters })
+    setSelectedSavedViewId('')
   }, [sessionUser, selectedGuild?.id])
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(LEDGER_SAVED_VIEWS_STORAGE_KEY, JSON.stringify(savedLedgerViews))
+    } catch {
+      // Ignore storage errors and keep the current session state in memory.
+    }
+  }, [savedLedgerViews])
 
   useEffect(() => {
     if (!sessionUser && currentPage !== 'ledger') {
@@ -1024,8 +1078,8 @@ function App() {
     }
   }, [])
 
-  const statisticsRows = buildStatisticsRows(activeEntries, statisticsRange)
-  const sortedEntries = [...activeEntries].sort((leftEntry, rightEntry) => {
+  const statisticsRows = buildStatisticsRows(filteredEntries, statisticsRange)
+  const sortedEntries = [...filteredEntries].sort((leftEntry, rightEntry) => {
     const leftValue = sortableEntryColumns[entrySort.column].getValue(leftEntry)
     const rightValue = sortableEntryColumns[entrySort.column].getValue(rightEntry)
 
@@ -1050,6 +1104,9 @@ function App() {
     entriesPerPage,
     entrySort.column,
     entrySort.direction,
+    JSON.stringify(ledgerFilters),
+    statisticsRange.startDate,
+    statisticsRange.endDate,
   ].join(':')
   const totalEntryPages = Math.max(1, Math.ceil(sortedEntries.length / entriesPerPage))
   const entryPage =
@@ -1075,6 +1132,11 @@ function App() {
 
   const handleApiError = (error) => {
     setGlobalError(error.message)
+    setGlobalNotice('')
+  }
+
+  const showViewOnlyGuildError = () => {
+    setGlobalError('You have viewer access to this guild. Ask the owner to promote you to admin before making changes.')
     setGlobalNotice('')
   }
 
@@ -1183,6 +1245,11 @@ function App() {
       return
     }
 
+    if (!selectedGuild.canEdit) {
+      showViewOnlyGuildError()
+      return
+    }
+
     setMutationPending(true)
     try {
       const response = await createEntryForGuild(selectedGuild.id, entryDraft)
@@ -1207,6 +1274,11 @@ function App() {
     }
 
     if (!selectedGuild) {
+      return false
+    }
+
+    if (!selectedGuild.canEdit) {
+      showViewOnlyGuildError()
       return false
     }
 
@@ -1240,6 +1312,11 @@ function App() {
     }
 
     if (!selectedGuild) {
+      return
+    }
+
+    if (!selectedGuild.canEdit) {
+      showViewOnlyGuildError()
       return
     }
 
@@ -1462,7 +1539,7 @@ function App() {
   }
 
   const handleOpenAuditLog = async (guild) => {
-    if (!guild?.id || !guild.isOwner) {
+    if (!guild?.id) {
       return
     }
 
@@ -1494,7 +1571,7 @@ function App() {
   }
 
   const handleCreateGuildInvite = async () => {
-    if (!guildAccessGuild?.isOwner) {
+    if (!guildAccessGuild?.canManagePermissions) {
       return
     }
 
@@ -1538,7 +1615,7 @@ function App() {
   }
 
   const handleRemoveGuildMember = async (guild, member) => {
-    if (!guild?.isOwner || member.isOwner) {
+    if (!guild?.canManagePermissions || member.isOwner) {
       return
     }
 
@@ -1553,6 +1630,25 @@ function App() {
     try {
       const response = await removeGuildMemberRequest(guild.id, member.userId)
       persistAuthenticatedUser(response.user, `${member.username} was removed from ${guild.name}.`)
+    } catch (error) {
+      setGuildAccessError(error.message)
+    } finally {
+      setMutationPending(false)
+    }
+  }
+
+  const handleUpdateGuildMemberRole = async (guild, member, role) => {
+    if (!guild?.canManagePermissions || member.isOwner || member.role === role) {
+      return
+    }
+
+    clearMessages()
+    setGuildAccessError('')
+    setMutationPending(true)
+
+    try {
+      const response = await updateGuildMemberRoleRequest(guild.id, member.userId, role)
+      persistAuthenticatedUser(response.user, `${member.username} is now a ${role}.`)
     } catch (error) {
       setGuildAccessError(error.message)
     } finally {
@@ -1601,6 +1697,12 @@ function App() {
   }
 
   const handleRenameGuild = async (guildId, currentName) => {
+    const guild = currentUser?.guilds?.find((candidateGuild) => candidateGuild.id === guildId)
+    if (!guild?.canEdit) {
+      showViewOnlyGuildError()
+      return
+    }
+
     const nextName = window.prompt('Guild name', currentName)
     if (!nextName?.trim()) {
       return
@@ -1619,6 +1721,12 @@ function App() {
   }
 
   const handleDeleteGuild = async (guildId) => {
+    const guild = currentUser?.guilds?.find((candidateGuild) => candidateGuild.id === guildId)
+    if (!guild?.canDelete) {
+      showViewOnlyGuildError()
+      return
+    }
+
     if (!window.confirm('Delete this guild profile and all of its entries?')) {
       return
     }
@@ -1657,6 +1765,11 @@ function App() {
       return false
     }
 
+    if (!selectedGuild.canEdit) {
+      showViewOnlyGuildError()
+      return false
+    }
+
     clearMessages()
     setMutationPending(true)
     try {
@@ -1673,6 +1786,11 @@ function App() {
 
   const handleUpdateTrackedMember = async (trackedMemberId, draft) => {
     if (!selectedGuild || !sessionUser) {
+      return false
+    }
+
+    if (!selectedGuild.canEdit) {
+      showViewOnlyGuildError()
       return false
     }
 
@@ -1695,6 +1813,11 @@ function App() {
       return
     }
 
+    if (!selectedGuild.canEdit) {
+      showViewOnlyGuildError()
+      return
+    }
+
     if (!window.confirm(`Delete ${trackedMember.name} from the tracked member roster?`)) {
       return
     }
@@ -1712,6 +1835,12 @@ function App() {
   }
 
   const applyGuildDueSettings = async (guildId, settings) => {
+    const guild = currentUser?.guilds?.find((candidateGuild) => candidateGuild.id === guildId)
+    if (!guild?.canEdit) {
+      showViewOnlyGuildError()
+      return false
+    }
+
     clearMessages()
     setMutationPending(true)
     try {
@@ -1741,6 +1870,11 @@ function App() {
       return false
     }
 
+    if (!selectedGuild.canEdit) {
+      showViewOnlyGuildError()
+      return false
+    }
+
     const nextDueScheme = settings?.dueScheme
     if (
       nextDueScheme &&
@@ -1759,7 +1893,97 @@ function App() {
     return applyGuildDueSettings(selectedGuild.id, settings)
   }
 
+  const handleLedgerFilterChange = (field, value) => {
+    setSelectedSavedViewId('')
+    setLedgerFilters((prev) => ({
+      ...prev,
+      [field]: value,
+    }))
+  }
+
+  const clearLedgerFilters = () => {
+    setSelectedSavedViewId('')
+    setLedgerFilters({ ...defaultLedgerFilters })
+    setStatisticsRange(createTodayStatisticsRange())
+  }
+
+  const handleSaveLedgerView = () => {
+    const proposedName = window.prompt('Saved view name', scopedSavedLedgerViews.find((view) => view.id === selectedSavedViewId)?.name || '')
+    const trimmedName = proposedName?.trim()
+    if (!trimmedName) {
+      return
+    }
+
+    let nextSelectedViewId = selectedSavedViewId
+    setSavedLedgerViews((prev) => {
+      const scopeViews = prev[ledgerSavedViewScope] ?? []
+      const existingView = scopeViews.find(
+        (view) => view.id === selectedSavedViewId || view.name.toLowerCase() === trimmedName.toLowerCase(),
+      )
+      const nextViewId = existingView?.id ?? crypto.randomUUID()
+      nextSelectedViewId = nextViewId
+      const nextView = {
+        id: nextViewId,
+        name: trimmedName,
+        filters: { ...ledgerFilters },
+        statisticsRange: { ...statisticsRange },
+      }
+
+      return {
+        ...prev,
+        [ledgerSavedViewScope]: [
+          ...scopeViews.filter((view) => view.id !== nextViewId),
+          nextView,
+        ].sort((leftView, rightView) => leftView.name.localeCompare(rightView.name, undefined, { sensitivity: 'base' })),
+      }
+    })
+    setSelectedSavedViewId(nextSelectedViewId)
+    setGlobalError('')
+    setGlobalNotice(`Saved ledger view: ${trimmedName}.`)
+  }
+
+  const handleApplySavedLedgerView = (viewId) => {
+    setSelectedSavedViewId(viewId)
+    const view = scopedSavedLedgerViews.find((savedView) => savedView.id === viewId)
+    if (!view) {
+      return
+    }
+
+    setLedgerFilters({ ...defaultLedgerFilters, ...view.filters })
+    setStatisticsRange(view.statisticsRange || createTodayStatisticsRange())
+    setGlobalError('')
+    setGlobalNotice(`Applied saved view: ${view.name}.`)
+  }
+
+  const handleDeleteSavedLedgerView = () => {
+    if (!selectedSavedViewId) {
+      return
+    }
+
+    const selectedView = scopedSavedLedgerViews.find((view) => view.id === selectedSavedViewId)
+    if (!selectedView) {
+      return
+    }
+
+    setSavedLedgerViews((prev) => {
+      const scopeViews = prev[ledgerSavedViewScope] ?? []
+      const nextScopeViews = scopeViews.filter((view) => view.id !== selectedSavedViewId)
+      const nextViews = { ...prev }
+      if (nextScopeViews.length === 0) {
+        delete nextViews[ledgerSavedViewScope]
+        return nextViews
+      }
+
+      nextViews[ledgerSavedViewScope] = nextScopeViews
+      return nextViews
+    })
+    setSelectedSavedViewId('')
+    setGlobalError('')
+    setGlobalNotice(`Deleted saved view: ${selectedView.name}.`)
+  }
+
   const handleStatisticsRangeChange = (field, value) => {
+    setSelectedSavedViewId('')
     setStatisticsRange((prev) => {
       const nextRange = {
         ...prev,
@@ -1835,7 +2059,7 @@ function App() {
     const guildName = selectedGuild?.name || 'Guest Ledger'
 
     if ((exportScope === 'member-management' || exportScope === 'full') && (!sessionUser || !selectedGuild)) {
-      setGlobalError('Choose a guild before exporting member management reports.')
+      setGlobalError('Choose a guild before exporting members and dues reports.')
       setGlobalNotice('')
       return
     }
@@ -1941,12 +2165,18 @@ function App() {
                 Elder Scrolls Online Guild Ledger
               </Typography>
               <Typography variant="h4" gutterBottom className="eso-hero-title">
-                {currentPage === 'ledger' ? 'Track Guild Gold Flow' : 'Member Management'}
+                {currentPage === 'ledger'
+                  ? 'Track Guild Gold Flow'
+                  : currentPage === 'dues'
+                    ? 'Dues Dashboard'
+                    : 'Member Management'}
               </Typography>
               <Typography variant="body1" className="eso-hero-subtitle">
                 {currentPage === 'ledger'
-                  ? 'Log deposits, withdrawals, and sales tax income with member-aware notes and suggestions.'
-                  : 'Manage tracked guild members, shared dues settings, and contribution history in one place.'}
+                  ? 'Track deposits, withdrawals, and sales tax with member-linked entries.'
+                  : currentPage === 'dues'
+                    ? 'Manage guild dues settings and review the current cycle.'
+                    : 'Add members, update names, and keep the roster current.'}
               </Typography>
             </Box>
 
@@ -1965,7 +2195,8 @@ function App() {
                   sx={{ minHeight: 48 }}
                 >
                   <Tab value="ledger" label="Ledger" />
-                  <Tab value="dues" label="Member Management" />
+                  <Tab value="dues" label="Dues" />
+                  <Tab value="member-management" label="Member Management" />
                 </Tabs>
               ) : (
                 <Box />
@@ -2002,12 +2233,12 @@ function App() {
                     </Button>
                   }
                 >
-                  Legacy browser data was detected for this account. Import it into the secure server.
+                  Legacy browser data was found for this account. Import it to the server.
                 </Alert>
               )}
               {legacyState && !sessionUser && !sessionLoading && (
                 <Alert severity="info">
-                  Legacy browser data was detected. Sign in to import it into the secure server.
+                  Legacy browser data was found. Sign in to import it to the server.
                 </Alert>
               )}
               {sessionUser && !sessionLoading && !currentUser?.email && (
@@ -2019,7 +2250,7 @@ function App() {
                     </Button>
                   }
                 >
-                  Add a verified recovery email in settings so password resets are possible.
+                  Add a verified recovery email in settings to enable password resets.
                 </Alert>
               )}
               {sessionUser && !sessionLoading && currentUser?.email && !currentUser.emailVerified && (
@@ -2031,12 +2262,12 @@ function App() {
                     </Button>
                   }
                 >
-                  Verify {currentUser.email} to finish enabling password recovery.
+                  Verify {currentUser.email} to enable password recovery.
                 </Alert>
               )}
               {!sessionUser && !sessionLoading && (
                 <Alert severity="warning">
-                  Guest mode is temporary. Create an account to store data on the server for publication.
+                  Guest mode is temporary. Create an account to save your data to the server.
                 </Alert>
               )}
             </Stack>
@@ -2052,12 +2283,18 @@ function App() {
                   <Alert severity="info">Create a guild profile in the right sidebar first.</Alert>
                 ) : (
                   <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
+                    {sessionUser && selectedGuild && !selectedGuild.canEdit && (
+                      <Alert severity="info" sx={{ width: '100%' }}>
+                        You have viewer access to this guild. Ledger entries are view-only until the owner grants admin access.
+                      </Alert>
+                    )}
                     <FormControl fullWidth>
                       <InputLabel id="entry-type-label">Type</InputLabel>
                       <Select
                         labelId="entry-type-label"
                         label="Type"
                         value={entryDraft.type}
+                        disabled={sessionUser && !canEditSelectedGuild}
                         onChange={(event) =>
                           setEntryDraft((prev) => ({
                             ...prev,
@@ -2081,6 +2318,7 @@ function App() {
                       label="Gold Amount"
                       type="number"
                       value={entryDraft.amount}
+                      disabled={sessionUser && !canEditSelectedGuild}
                       onChange={(event) =>
                         setEntryDraft((prev) => ({ ...prev, amount: event.target.value }))
                       }
@@ -2090,6 +2328,7 @@ function App() {
                       label="Date"
                       type="date"
                       value={entryDraft.date}
+                      disabled={sessionUser && !canEditSelectedGuild}
                       onChange={(event) =>
                         setEntryDraft((prev) => ({ ...prev, date: event.target.value }))
                       }
@@ -2100,6 +2339,7 @@ function App() {
                       fullWidth
                       options={memberSuggestions}
                       value={entryDraft.user}
+                      readOnly={sessionUser && !canEditSelectedGuild}
                       onInputChange={(_event, value) =>
                         setEntryDraft((prev) => ({ ...prev, user: value }))
                       }
@@ -2114,6 +2354,7 @@ function App() {
                       fullWidth
                       label="Optional Notes"
                       value={entryDraft.notes}
+                      disabled={sessionUser && !canEditSelectedGuild}
                       onChange={(event) =>
                         setEntryDraft((prev) => ({ ...prev, notes: event.target.value }))
                       }
@@ -2124,6 +2365,7 @@ function App() {
                           control={
                             <Checkbox
                               checked={entryDraft.isDonation}
+                              disabled={sessionUser && !canEditSelectedGuild}
                               onChange={(event) =>
                                 setEntryDraft((prev) => ({
                                   ...prev,
@@ -2139,6 +2381,7 @@ function App() {
                           control={
                             <Checkbox
                               checked={entryDraft.isDue}
+                              disabled={sessionUser && !canEditSelectedGuild}
                               onChange={(event) =>
                                 setEntryDraft((prev) => ({
                                   ...prev,
@@ -2164,6 +2407,7 @@ function App() {
                               control={
                                 <Checkbox
                                   checked={entryDraft.withdrawalCategory === option.value}
+                                  disabled={sessionUser && !canEditSelectedGuild}
                                   onChange={(event) =>
                                     setEntryDraft((prev) => ({
                                       ...prev,
@@ -2178,11 +2422,185 @@ function App() {
                         </Stack>
                       </Stack>
                     )}
-                    <Button variant="contained" onClick={saveEntry} disabled={mutationPending}>
+                    <Button variant="contained" onClick={saveEntry} disabled={mutationPending || (sessionUser && !canEditSelectedGuild)}>
                       Save
                     </Button>
                   </Stack>
                 )}
+              </CardContent>
+            </Card>
+
+            <Card sx={{ mb: 3 }}>
+              <CardContent>
+                <Stack spacing={2.5}>
+                  <Stack direction={{ xs: 'column', md: 'row' }} spacing={2} justifyContent="space-between" alignItems={{ xs: 'stretch', md: 'center' }}>
+                    <Box>
+                      <Typography variant="h6">Search, Filters, and Saved Views</Typography>
+                      <Typography variant="body2" color="text.secondary">
+                        Narrow the ledger by member, amount, type, notes, and dates. Saved views keep recurring review setups one click away.
+                      </Typography>
+                    </Box>
+                    <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.25} useFlexGap flexWrap="wrap">
+                      <FormControl size="small" sx={{ minWidth: 220 }}>
+                        <InputLabel id="saved-ledger-view-label">Saved view</InputLabel>
+                        <Select
+                          labelId="saved-ledger-view-label"
+                          label="Saved view"
+                          value={selectedSavedViewId}
+                          onChange={(event) => {
+                            const nextValue = event.target.value
+                            if (!nextValue) {
+                              setSelectedSavedViewId('')
+                              return
+                            }
+
+                            handleApplySavedLedgerView(nextValue)
+                          }}
+                        >
+                          <MenuItem value="">Custom view</MenuItem>
+                          {scopedSavedLedgerViews.map((view) => (
+                            <MenuItem key={view.id} value={view.id}>
+                              {view.name}
+                            </MenuItem>
+                          ))}
+                        </Select>
+                      </FormControl>
+                      <Button variant="outlined" onClick={handleSaveLedgerView}>
+                        Save current view
+                      </Button>
+                      <Button variant="outlined" color="error" onClick={handleDeleteSavedLedgerView} disabled={!selectedSavedViewId}>
+                        Delete view
+                      </Button>
+                      <Button variant="text" onClick={clearLedgerFilters} disabled={!hasActiveLedgerViewFilters && !selectedSavedViewId}>
+                        Clear filters
+                      </Button>
+                    </Stack>
+                  </Stack>
+
+                  <Stack direction={{ xs: 'column', md: 'row' }} spacing={1.5} useFlexGap flexWrap="wrap">
+                    <TextField
+                      label="Search notes, members, and types"
+                      value={ledgerFilters.search}
+                      onChange={(event) => handleLedgerFilterChange('search', event.target.value)}
+                      sx={{ minWidth: { xs: '100%', md: 260 } }}
+                    />
+                    <Autocomplete
+                      freeSolo
+                      options={memberSuggestions}
+                      value={ledgerFilters.member}
+                      onInputChange={(_event, value) => handleLedgerFilterChange('member', value)}
+                      renderInput={(params) => (
+                        <TextField {...params} label="Member filter" sx={{ minWidth: { xs: '100%', md: 220 } }} />
+                      )}
+                    />
+                    <FormControl size="small" sx={{ minWidth: 170 }}>
+                      <InputLabel id="entry-type-filter-label">Entry type</InputLabel>
+                      <Select
+                        labelId="entry-type-filter-label"
+                        label="Entry type"
+                        value={ledgerFilters.entryType}
+                        onChange={(event) => handleLedgerFilterChange('entryType', event.target.value)}
+                      >
+                        <MenuItem value="all">All types</MenuItem>
+                        {entryTypes.map((entryType) => (
+                          <MenuItem key={entryType.value} value={entryType.value}>
+                            {entryType.label}
+                          </MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                    <FormControl size="small" sx={{ minWidth: 180 }}>
+                      <InputLabel id="deposit-kind-filter-label">Deposit subtype</InputLabel>
+                      <Select
+                        labelId="deposit-kind-filter-label"
+                        label="Deposit subtype"
+                        value={ledgerFilters.depositKind}
+                        disabled={!['all', 'deposit'].includes(ledgerFilters.entryType)}
+                        onChange={(event) => handleLedgerFilterChange('depositKind', event.target.value)}
+                      >
+                        <MenuItem value="all">All deposits</MenuItem>
+                        <MenuItem value="due">Dues only</MenuItem>
+                        <MenuItem value="donation">Donations only</MenuItem>
+                        <MenuItem value="standard">Standard deposits</MenuItem>
+                      </Select>
+                    </FormControl>
+                    <FormControl size="small" sx={{ minWidth: 190 }}>
+                      <InputLabel id="withdrawal-category-filter-label">Withdrawal category</InputLabel>
+                      <Select
+                        labelId="withdrawal-category-filter-label"
+                        label="Withdrawal category"
+                        value={ledgerFilters.withdrawalCategory}
+                        disabled={!['all', 'withdrawal'].includes(ledgerFilters.entryType)}
+                        onChange={(event) => handleLedgerFilterChange('withdrawalCategory', event.target.value)}
+                      >
+                        <MenuItem value="all">All withdrawals</MenuItem>
+                        {withdrawalCategoryOptions.map((option) => (
+                          <MenuItem key={option.value} value={option.value}>
+                            {option.label}
+                          </MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                    <TextField
+                      label="Min amount"
+                      type="number"
+                      value={ledgerFilters.minAmount}
+                      onChange={(event) => handleLedgerFilterChange('minAmount', event.target.value)}
+                      sx={{ minWidth: 140 }}
+                    />
+                    <TextField
+                      label="Max amount"
+                      type="number"
+                      value={ledgerFilters.maxAmount}
+                      onChange={(event) => handleLedgerFilterChange('maxAmount', event.target.value)}
+                      sx={{ minWidth: 140 }}
+                    />
+                  </Stack>
+
+                  <Stack direction={{ xs: 'column', md: 'row' }} spacing={1.5} useFlexGap flexWrap="wrap" alignItems={{ xs: 'stretch', md: 'center' }}>
+                    <TextField
+                      type="date"
+                      label="Start date"
+                      value={statisticsRange.startDate}
+                      onChange={(event) => handleStatisticsRangeChange('startDate', event.target.value)}
+                      InputLabelProps={{ shrink: true }}
+                      sx={{ minWidth: 170 }}
+                    />
+                    <TextField
+                      type="date"
+                      label="End date"
+                      value={statisticsRange.endDate}
+                      onChange={(event) => handleStatisticsRangeChange('endDate', event.target.value)}
+                      InputLabelProps={{ shrink: true }}
+                      sx={{ minWidth: 170 }}
+                    />
+                    <Button
+                      variant="outlined"
+                      onClick={() => {
+                        setSelectedSavedViewId('')
+                        setStatisticsRange(createAllStatisticsRange(activeEntries))
+                        setCollapsedStatisticsSections((prev) => ({ ...prev, Daily: true }))
+                      }}
+                    >
+                      All dates
+                    </Button>
+                    <Button
+                      variant="outlined"
+                      onClick={() => {
+                        setSelectedSavedViewId('')
+                        setStatisticsRange(createTodayStatisticsRange())
+                      }}
+                    >
+                      Today
+                    </Button>
+                  </Stack>
+
+                  <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} useFlexGap flexWrap="wrap">
+                    <Chip label={`Showing ${filteredEntries.length} of ${activeEntries.length} entries`} color="primary" variant={hasActiveLedgerViewFilters ? 'filled' : 'outlined'} />
+                    <Chip label={`Date range: ${formatDisplayDate(statisticsRange.startDate)} - ${formatDisplayDate(statisticsRange.endDate)}`} variant="outlined" />
+                    {hasActiveLedgerViewFilters && <Chip label="Filtered view active" color="warning" variant="outlined" />}
+                  </Stack>
+                </Stack>
               </CardContent>
             </Card>
 
@@ -2192,44 +2610,28 @@ function App() {
                   direction={{ xs: 'column', md: 'row' }}
                   spacing={2}
                   justifyContent="space-between"
+                  alignItems={{ xs: 'stretch', md: 'center' }}
                   sx={{ mb: 2 }}
                 >
-                  <Typography variant="h6">Statistics</Typography>
-                  <Stack direction="row" spacing={1.5} alignItems="center" flexWrap="wrap">
-                    <TextField
-                      type="date"
-                      value={statisticsRange.startDate}
-                      onChange={(event) => handleStatisticsRangeChange('startDate', event.target.value)}
-                      inputProps={{ 'aria-label': 'Start date' }}
-                      sx={{ width: { xs: '100%', sm: 'auto' }, minWidth: { sm: 170 } }}
-                    />
-                    <Typography variant="body1">&ndash;</Typography>
-                    <TextField
-                      type="date"
-                      value={statisticsRange.endDate}
-                      onChange={(event) => handleStatisticsRangeChange('endDate', event.target.value)}
-                      inputProps={{ 'aria-label': 'End date' }}
-                      sx={{ width: { xs: '100%', sm: 'auto' }, minWidth: { sm: 170 } }}
-                    />
-                    <Button
-                      variant="outlined"
-                      onClick={() => {
-                        setStatisticsRange(createAllStatisticsRange(activeEntries))
-                        setCollapsedStatisticsSections((prev) => ({ ...prev, Daily: true }))
-                      }}
-                    >
-                      All
-                    </Button>
-                    <Button variant="outlined" onClick={() => setStatisticsRange(createTodayStatisticsRange())}>
-                      Today
-                    </Button>
+                  <Box>
+                    <Typography variant="h6">Statistics</Typography>
+                    <Typography variant="body2" color="text.secondary">
+                      Aggregates reflect the current filtered ledger view, so reports stay readable as the log grows.
+                    </Typography>
+                  </Box>
+                  <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} useFlexGap flexWrap="wrap">
+                    <Chip label={`Periods shown: ${statisticsRows.filter((row) => !row.isSectionHeader).length}`} variant="outlined" />
+                    <Chip label={`Entries in view: ${filteredEntries.length}`} variant="outlined" />
+                    <Chip label={`Top donors shown per row: ${filteredEntries.length > 0 ? 'Up to 3' : '0'}`} variant="outlined" />
                   </Stack>
                 </Stack>
                 <TableContainer sx={{ overflowX: 'auto' }}>
-                  <Table size="small" sx={{ minWidth: 560 }}>
+                  <Table stickyHeader size="small" sx={{ minWidth: 860 }}>
                     <TableHead>
                       <TableRow>
                         <TableCell>Range</TableCell>
+                        <TableCell align="right">Entries</TableCell>
+                        <TableCell>Top Contributors</TableCell>
                         <TableCell align="right">Deposits</TableCell>
                         <TableCell align="right">Withdrawals</TableCell>
                         <TableCell align="right">Sales Tax</TableCell>
@@ -2241,7 +2643,7 @@ function App() {
                         if (statisticsRow.isSectionHeader) {
                           return (
                             <TableRow key={statisticsRow.section}>
-                              <TableCell colSpan={5} sx={{ fontWeight: 700, pt: 2, pb: 1 }}>
+                              <TableCell colSpan={7} sx={{ fontWeight: 700, pt: 2, pb: 1, backgroundColor: 'rgba(199, 161, 93, 0.08)' }}>
                                 <Stack
                                   direction="row"
                                   spacing={1}
@@ -2275,22 +2677,30 @@ function App() {
                           statisticsRow.totals.withdrawal
 
                         return (
-                          <TableRow key={`${statisticsRow.section}-${statisticsRow.label}`}>
+                          <TableRow key={`${statisticsRow.section}-${statisticsRow.label}`} sx={{ '&:nth-of-type(even)': { backgroundColor: 'rgba(255, 255, 255, 0.02)' } }}>
                             <TableCell>
-                              <Stack spacing={0.25}>
-                                <Typography variant="body2">{statisticsRow.label}</Typography>
-                                {statisticsRow.topDonors?.length ? (
-                                  statisticsRow.topDonors.map((donor) => (
-                                    <Typography key={`${statisticsRow.label}-${donor.rank}-${donor.username}`} variant="caption" color="text.secondary">
-                                      {`#${donor.rank} contributing member: ${donor.username} (${fmtGold(donor.amount)})`}
-                                    </Typography>
-                                  ))
-                                ) : (
-                                  <Typography variant="caption" color="text.secondary">
-                                    Top contributing members: No donation deposits recorded
-                                  </Typography>
-                                )}
-                              </Stack>
+                              <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                                {statisticsRow.label}
+                              </Typography>
+                            </TableCell>
+                            <TableCell align="right">{statisticsRow.entryCount ?? 0}</TableCell>
+                            <TableCell>
+                              {statisticsRow.topDonors?.length ? (
+                                <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                                  {statisticsRow.topDonors.map((donor) => (
+                                    <Chip
+                                      key={`${statisticsRow.label}-${donor.rank}-${donor.username}`}
+                                      size="small"
+                                      label={`#${donor.rank} ${donor.username} • ${fmtGold(donor.amount)}`}
+                                      variant="outlined"
+                                    />
+                                  ))}
+                                </Stack>
+                              ) : (
+                                <Typography variant="caption" color="text.secondary">
+                                  No donation deposits recorded
+                                </Typography>
+                              )}
                             </TableCell>
                             <TableCell align="right">{fmtGold(statisticsRow.totals.deposit)}</TableCell>
                             <TableCell align="right">{fmtGold(statisticsRow.totals.withdrawal)}</TableCell>
@@ -2314,13 +2724,13 @@ function App() {
                     <Typography variant="h6" sx={{ mb: 2 }}>
                       Statistics Graph
                     </Typography>
-                    <Graph entries={activeEntries} statisticsRange={statisticsRange} />
+                    <Graph entries={filteredEntries} statisticsRange={statisticsRange} />
                   </Box>
                   <Box>
                     <Typography variant="h6" sx={{ mb: 2 }}>
                       Entry Breakdown
                     </Typography>
-                    <PieBreakdownChart entries={activeEntries} statisticsRange={statisticsRange} />
+                    <PieBreakdownChart entries={filteredEntries} statisticsRange={statisticsRange} />
                   </Box>
                 </Stack>
               </CardContent>
@@ -2342,7 +2752,10 @@ function App() {
                     useFlexGap
                     alignItems={{ xs: 'stretch', sm: 'center' }}
                   >
-                    <Typography variant="h6">Log Entries</Typography>
+                    <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} useFlexGap alignItems={{ xs: 'stretch', sm: 'center' }}>
+                      <Typography variant="h6">Log Entries</Typography>
+                      <Chip size="small" label={`${sortedEntries.length} matching`} variant="outlined" />
+                    </Stack>
                     <Pagination
                       color="primary"
                       count={totalEntryPages}
@@ -2435,6 +2848,12 @@ function App() {
                             No entries yet.
                           </TableCell>
                         </TableRow>
+                      ) : visibleEntries.length === 0 ? (
+                        <TableRow>
+                          <TableCell colSpan={6} align="center">
+                            No entries match the current search and filter view.
+                          </TableCell>
+                        </TableRow>
                       ) : (
                         visibleEntries.map((entry) => (
                           <TableRow key={entry.id}>
@@ -2465,10 +2884,10 @@ function App() {
                             <TableCell align="right">{fmtGold(entry.amount)}</TableCell>
                             <TableCell>{entry.notes || '—'}</TableCell>
                             <TableCell align="right">
-                              <IconButton onClick={() => setEditingEntry({ ...entry })}>
+                              <IconButton onClick={() => setEditingEntry({ ...entry })} disabled={sessionUser && !canEditSelectedGuild}>
                                 <EditIcon />
                               </IconButton>
-                              <IconButton onClick={() => deleteEntry(entry.id)} disabled={mutationPending}>
+                              <IconButton onClick={() => deleteEntry(entry.id)} disabled={mutationPending || (sessionUser && !canEditSelectedGuild)}>
                                 <DeleteIcon />
                               </IconButton>
                             </TableCell>
@@ -2488,15 +2907,27 @@ function App() {
                 selectedGuild={selectedGuild}
                 entries={activeEntries}
                 trackedMembers={trackedMembers}
-                overviewRef={memberManagementOverviewRef}
-                rosterRef={memberManagementRosterRef}
-                historyRef={memberManagementHistoryRef}
+                overviewRef={duesOverviewRef}
+                historyRef={duesHistoryRef}
                 mutationPending={mutationPending}
+                canEdit={canEditSelectedGuild}
                 onUpdateGuildDuesSettings={handleUpdateGuildDueSettings}
+                onUpdateTrackedMember={handleUpdateTrackedMember}
+                fmtGold={fmtGold}
+              />
+            )}
+
+            {currentPage === 'member-management' && sessionUser && (
+              <MemberManagementPage
+                selectedGuild={selectedGuild}
+                trackedMembers={trackedMembers}
+                controlsRef={memberManagementControlsRef}
+                tableRef={memberManagementRosterRef}
+                mutationPending={mutationPending}
+                canEdit={canEditSelectedGuild}
                 onCreateTrackedMember={handleCreateTrackedMember}
                 onUpdateTrackedMember={handleUpdateTrackedMember}
                 onDeleteTrackedMember={handleDeleteTrackedMember}
-                fmtGold={fmtGold}
               />
             )}
           </Box>
@@ -2604,6 +3035,7 @@ function App() {
         handleCreateGuildInvite={handleCreateGuildInvite}
         mutationPending={mutationPending}
         guildAccessInviteCode={guildAccessInviteCode}
+        handleUpdateGuildMemberRole={handleUpdateGuildMemberRole}
         handleRemoveGuildMember={handleRemoveGuildMember}
       />
 
@@ -2621,7 +3053,7 @@ function App() {
         <DialogContent>
           <Stack spacing={2} sx={{ mt: 1 }}>
             <Typography variant="body2" color="text.secondary">
-              Choose whether to export ledger activity, member management, or a combined full report, then pick CSV or PDF.
+              Choose whether to export ledger activity, the combined members and dues report, or a full report, then pick CSV or PDF.
             </Typography>
             <FormControl fullWidth>
               <InputLabel id="export-scope-label">Report selection</InputLabel>
@@ -2654,8 +3086,8 @@ function App() {
               {exportScope === 'ledger'
                 ? 'Ledger exports include the statistics rollup and the full entry log for the selected guild or guest ledger.'
                 : exportScope === 'member-management'
-                  ? 'Member management exports include shared dues settings, roster status, and recent dues and donation history.'
-                  : 'Full combined exports bundle both the ledger report and member management report into one file.'}
+                  ? 'Members and dues exports include shared dues settings, roster status, and recent dues and donation history.'
+                  : 'Full combined exports bundle both the ledger report and the members and dues report into one file.'}
             </Alert>
           </Stack>
         </DialogContent>
@@ -2721,6 +3153,7 @@ function App() {
                   labelId="edit-entry-type"
                   label="Type"
                   value={editingEntry.type}
+                  disabled={sessionUser && !canEditSelectedGuild}
                   onChange={(event) =>
                     setEditingEntry((prev) => ({
                       ...prev,
@@ -2743,6 +3176,7 @@ function App() {
                 label="Amount"
                 type="number"
                 value={editingEntry.amount}
+                disabled={sessionUser && !canEditSelectedGuild}
                 onChange={(event) =>
                   setEditingEntry((prev) => ({ ...prev, amount: Number(event.target.value) }))
                 }
@@ -2751,6 +3185,7 @@ function App() {
                 label="Date"
                 type="date"
                 value={editingEntry.date}
+                disabled={sessionUser && !canEditSelectedGuild}
                 onChange={(event) =>
                   setEditingEntry((prev) => ({ ...prev, date: event.target.value }))
                 }
@@ -2760,6 +3195,7 @@ function App() {
                 freeSolo
                 options={memberSuggestions}
                 value={editingEntry.user || ''}
+                readOnly={sessionUser && !canEditSelectedGuild}
                 onInputChange={(_event, value) =>
                   setEditingEntry((prev) => ({ ...prev, user: value }))
                 }
@@ -2768,6 +3204,7 @@ function App() {
               <TextField
                 label="Notes"
                 value={editingEntry.notes}
+                disabled={sessionUser && !canEditSelectedGuild}
                 onChange={(event) =>
                   setEditingEntry((prev) => ({ ...prev, notes: event.target.value }))
                 }
@@ -2780,6 +3217,7 @@ function App() {
                     control={
                       <Checkbox
                         checked={Boolean(editingEntry.isDonation)}
+                        disabled={sessionUser && !canEditSelectedGuild}
                         onChange={(event) =>
                           setEditingEntry((prev) => ({
                             ...prev,
@@ -2795,6 +3233,7 @@ function App() {
                     control={
                       <Checkbox
                         checked={Boolean(editingEntry.isDue)}
+                        disabled={sessionUser && !canEditSelectedGuild}
                         onChange={(event) =>
                           setEditingEntry((prev) => ({
                             ...prev,
@@ -2820,6 +3259,7 @@ function App() {
                         control={
                           <Checkbox
                             checked={editingEntry.withdrawalCategory === option.value}
+                            disabled={sessionUser && !canEditSelectedGuild}
                             onChange={(event) =>
                               setEditingEntry((prev) => ({
                                 ...prev,
@@ -2840,6 +3280,7 @@ function App() {
         <DialogActions sx={{ px: 3, pb: 2 }}>
           <Button onClick={() => setEditingEntry(null)}>Cancel</Button>
           <Button
+            disabled={sessionUser && !canEditSelectedGuild}
             onClick={() =>
               setEditingEntry((prev) => ({
                 ...prev,
@@ -2851,7 +3292,7 @@ function App() {
           </Button>
           <Button
             variant="contained"
-            disabled={mutationPending}
+            disabled={mutationPending || (sessionUser && !canEditSelectedGuild)}
             onClick={async () => {
               if (editingEntry.amount <= 0) {
                 return

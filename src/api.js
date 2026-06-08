@@ -203,6 +203,12 @@ export const removeGuildMember = (guildId, memberUserId) =>
     method: 'DELETE',
   })
 
+export const updateGuildMemberRole = (guildId, memberUserId, role) =>
+  apiRequest(`/api/guilds/${guildId}/members/${memberUserId}`, {
+    method: 'PATCH',
+    body: { role },
+  })
+
 export const createTrackedMemberForGuild = (guildId, payload) =>
   apiRequest(`/api/guilds/${guildId}/tracked-members`, {
     method: 'POST',

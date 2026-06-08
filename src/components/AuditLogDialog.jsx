@@ -13,6 +13,7 @@ import {
   TableRow,
   Typography,
 } from '@mui/material'
+import { formatDisplayDateTime } from '../utils/dateFormatting'
 
 function titleCase(value) {
   return String(value || '')
@@ -27,16 +28,7 @@ function formatAction(action) {
 }
 
 function formatTimestamp(value) {
-  if (!value) {
-    return 'Unknown time'
-  }
-
-  const parsed = new Date(value)
-  if (Number.isNaN(parsed.getTime())) {
-    return value
-  }
-
-  return parsed.toLocaleString()
+  return formatDisplayDateTime(value)
 }
 
 function formatTarget(auditLog) {

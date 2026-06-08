@@ -31,6 +31,7 @@ const authRateLimitMax = Number(process.env.AUTH_RATE_LIMIT) || 10
 const backupRetentionCount = Number(process.env.BACKUP_RETENTION_COUNT) || 20
 const backupMinIntervalMs = Number(process.env.BACKUP_MIN_INTERVAL_MS) || 5 * 60 * 1000
 const isProduction = process.env.NODE_ENV === 'production'
+const guildRoles = new Set(['viewer', 'admin', 'owner'])
 const entryTypes = new Set(['deposit', 'withdrawal', 'salesTax'])
 const withdrawalCategories = new Set(['traderBid', 'heraldry', 'other'])
 const smtpHost = process.env.SMTP_HOST || ''
@@ -107,6 +108,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS guild_members (
     guild_id TEXT NOT NULL,
     user_id INTEGER NOT NULL,
+    role TEXT NOT NULL DEFAULT 'viewer',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (guild_id, user_id),
     FOREIGN KEY (guild_id) REFERENCES guilds (id) ON DELETE CASCADE,
@@ -191,6 +193,7 @@ const userColumns = db.prepare('PRAGMA table_info(users)').all()
 const guildColumns = db.prepare('PRAGMA table_info(guilds)').all()
 const entryColumns = db.prepare('PRAGMA table_info(entries)').all()
 const trackedMemberColumns = db.prepare('PRAGMA table_info(tracked_members)').all()
+const guildMemberColumns = db.prepare('PRAGMA table_info(guild_members)').all()
 if (!guildInviteColumns.some((column) => column.name === 'single_use')) {
   db.exec('ALTER TABLE guild_invites ADD COLUMN single_use INTEGER NOT NULL DEFAULT 1')
 }
@@ -237,6 +240,17 @@ if (!trackedMemberColumns.some((column) => column.name === 'is_active')) {
 if (!trackedMemberColumns.some((column) => column.name === 'dues_exempt')) {
   db.exec('ALTER TABLE tracked_members ADD COLUMN dues_exempt INTEGER NOT NULL DEFAULT 0')
 }
+if (!guildMemberColumns.some((column) => column.name === 'role')) {
+  db.exec("ALTER TABLE guild_members ADD COLUMN role TEXT NOT NULL DEFAULT 'viewer'")
+}
+db.exec(`
+  UPDATE guild_members
+  SET role = CASE
+    WHEN user_id = (SELECT guilds.user_id FROM guilds WHERE guilds.id = guild_members.guild_id) THEN 'owner'
+    WHEN role IS NULL OR role = '' OR role = 'viewer' THEN 'admin'
+    ELSE role
+  END
+`)
 db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique ON users (email) WHERE email IS NOT NULL')
 
 db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(new Date().toISOString())
@@ -315,7 +329,8 @@ const statements = {
             guilds.default_dues_amount AS defaultDuesAmount,
             guilds.created_at AS createdAt,
             guilds.user_id AS ownerUserId,
-            owners.username AS ownerUsername
+            owners.username AS ownerUsername,
+            guild_members.role AS membershipRole
      FROM guilds
      JOIN guild_members ON guild_members.guild_id = guilds.id
      JOIN users AS owners ON owners.id = guilds.user_id
@@ -339,6 +354,7 @@ const statements = {
   listGuildMembersForGuild: db.prepare(
     `SELECT users.id AS userId,
             users.username,
+            guild_members.role AS role,
             CASE WHEN users.id = guilds.user_id THEN 1 ELSE 0 END AS isOwner
      FROM guild_members
      JOIN users ON users.id = guild_members.user_id
@@ -367,7 +383,8 @@ const statements = {
             guilds.name,
             guilds.week_start_date AS weekStartDate,
             guilds.due_scheme AS dueScheme,
-            guilds.default_dues_amount AS defaultDuesAmount
+            guilds.default_dues_amount AS defaultDuesAmount,
+            guild_members.role AS membershipRole
      FROM guilds
      JOIN guild_members ON guild_members.guild_id = guilds.id
      WHERE guilds.id = ? AND guild_members.user_id = ?`,
@@ -377,12 +394,17 @@ const statements = {
       VALUES (@id, @userId, @name, @weekStartDate, @dueScheme, @defaultDuesAmount)`,
   ),
   createGuildMember: db.prepare(
-    `INSERT OR IGNORE INTO guild_members (guild_id, user_id)
-     VALUES (?, ?)`,
+    `INSERT OR IGNORE INTO guild_members (guild_id, user_id, role)
+     VALUES (?, ?, ?)`,
   ),
   findGuildMember: db.prepare(
-    `SELECT guild_id AS guildId, user_id AS userId
+    `SELECT guild_id AS guildId, user_id AS userId, role
      FROM guild_members
+     WHERE guild_id = ? AND user_id = ?`,
+  ),
+  updateGuildMemberRole: db.prepare(
+    `UPDATE guild_members
+     SET role = ?
      WHERE guild_id = ? AND user_id = ?`,
   ),
   findTrackedMemberForGuild: db.prepare(
@@ -1062,6 +1084,15 @@ function resolveInviteExpiry(expiresInHours) {
   return new Date(Date.now() + parsedHours * 60 * 60 * 1000).toISOString()
 }
 
+function sanitizeGuildRole(value) {
+  const normalizedValue = String(value || '').trim().toLowerCase()
+  if (!guildRoles.has(normalizedValue)) {
+    throw createHttpError(400, 'Choose a valid guild role.')
+  }
+
+  return normalizedValue
+}
+
 function ensureGuildForUser(userId, guildId) {
   const guild = statements.findGuildForUser.get(guildId, userId)
   if (!guild) {
@@ -1073,8 +1104,17 @@ function ensureGuildForUser(userId, guildId) {
 
 function ensureGuildOwner(userId, guildId) {
   const guild = ensureGuildForUser(userId, guildId)
-  if (guild.ownerUserId !== userId) {
+  if (guild.membershipRole !== 'owner') {
     throw createHttpError(403, 'Only the guild owner can manage sharing and member access for this guild.')
+  }
+
+  return guild
+}
+
+function ensureGuildEditor(userId, guildId) {
+  const guild = ensureGuildForUser(userId, guildId)
+  if (!['admin', 'owner'].includes(guild.membershipRole)) {
+    throw createHttpError(403, 'You have view-only access to this guild. Ask the owner to grant admin access before making changes.')
   }
 
   return guild
@@ -1094,9 +1134,14 @@ function serializeUser(userId) {
     ...guild,
     dueScheme: guild.dueScheme === 'weekly' ? 'weekly' : 'monthly',
     defaultDuesAmount: Number(guild.defaultDuesAmount) || 0,
+    role: sanitizeGuildRole(guild.membershipRole),
     isOwner: guild.ownerUserId === userId,
+    canEdit: ['admin', 'owner'].includes(guild.membershipRole),
+    canManagePermissions: guild.membershipRole === 'owner',
+    canDelete: guild.membershipRole === 'owner',
     members: statements.listGuildMembersForGuild.all(guild.id).map((member) => ({
       ...member,
+      role: sanitizeGuildRole(member.role),
       isOwner: Boolean(member.isOwner),
     })),
     trackedMembers: statements.listTrackedMembersForGuild.all(guild.id).map((member) => ({
@@ -1458,7 +1503,7 @@ app.post('/api/guilds', requireAuth, (request, response, next) => {
         dueScheme,
         defaultDuesAmount,
       })
-      statements.createGuildMember.run(guildId, request.user.id)
+      statements.createGuildMember.run(guildId, request.user.id, 'owner')
       writeAuditLog({
         actorUserId: request.user.id,
         action: 'guild.create',
@@ -1483,9 +1528,6 @@ app.post('/api/guilds', requireAuth, (request, response, next) => {
 app.get('/api/guilds/:guildId/audit-logs', requireAuth, (request, response, next) => {
   try {
     const guild = ensureGuildForUser(request.user.id, request.params.guildId)
-    if (guild.ownerUserId !== request.user.id) {
-      throw createHttpError(403, 'Only guild owners can view this audit history.')
-    }
 
     response.json({
       auditLogs: statements.listAuditLogsForGuild
@@ -1521,7 +1563,7 @@ app.post('/api/guilds/import-guest', requireAuth, (request, response, next) => {
         dueScheme,
         defaultDuesAmount,
       })
-      statements.createGuildMember.run(guildId, request.user.id)
+      statements.createGuildMember.run(guildId, request.user.id, 'owner')
 
       for (const entry of normalizedEntries) {
         statements.createEntry.run({ ...entry, guildId })
@@ -1548,30 +1590,30 @@ app.post('/api/guilds/import-guest', requireAuth, (request, response, next) => {
 
 app.patch('/api/guilds/:guildId', requireAuth, (request, response, next) => {
   try {
-    const guild = ensureGuildOwner(request.user.id, request.params.guildId)
+    const guild = ensureGuildEditor(request.user.id, request.params.guildId)
     const updates = []
 
     if (typeof request.body?.name !== 'undefined') {
       const name = sanitizeGuildName(request.body.name)
-      statements.renameGuild.run(name, guild.id, request.user.id)
+      statements.renameGuild.run(name, guild.id, guild.ownerUserId)
       updates.push('name')
     }
 
     if (typeof request.body?.weekStartDate !== 'undefined') {
       const weekStartDate = sanitizeWeekStartDate(request.body.weekStartDate)
-      statements.updateGuildWeekStartDate.run(weekStartDate, guild.id, request.user.id)
+      statements.updateGuildWeekStartDate.run(weekStartDate, guild.id, guild.ownerUserId)
       updates.push('weekStartDate')
     }
 
     if (typeof request.body?.dueScheme !== 'undefined') {
       const dueScheme = sanitizeDueScheme(request.body.dueScheme)
-      statements.updateGuildDueScheme.run(dueScheme, guild.id, request.user.id)
+      statements.updateGuildDueScheme.run(dueScheme, guild.id, guild.ownerUserId)
       updates.push('dueScheme')
     }
 
     if (typeof request.body?.defaultDuesAmount !== 'undefined') {
       const defaultDuesAmount = sanitizeDefaultDuesAmount(request.body.defaultDuesAmount)
-      statements.updateGuildDefaultDuesAmount.run(defaultDuesAmount, guild.id, request.user.id)
+      statements.updateGuildDefaultDuesAmount.run(defaultDuesAmount, guild.id, guild.ownerUserId)
       statements.resetTrackedMembersToDefaultForGuild.run(guild.id)
       updates.push('defaultDuesAmount')
     }
@@ -1709,7 +1751,7 @@ app.post('/api/invites/redeem', requireAuth, (request, response, next) => {
     }
 
     const transaction = db.transaction(() => {
-      statements.createGuildMember.run(invite.guildId, request.user.id)
+      statements.createGuildMember.run(invite.guildId, request.user.id, 'viewer')
       statements.updateUserSelectedGuild.run(invite.guildId, request.user.id)
       writeAuditLog({
         actorUserId: request.user.id,
@@ -1772,9 +1814,48 @@ app.delete('/api/guilds/:guildId/members/:memberUserId', requireAuth, (request, 
   }
 })
 
+app.patch('/api/guilds/:guildId/members/:memberUserId', requireAuth, (request, response, next) => {
+  try {
+    const guild = ensureGuildOwner(request.user.id, request.params.guildId)
+    const memberUserId = Number(request.params.memberUserId)
+
+    if (!Number.isInteger(memberUserId)) {
+      throw createHttpError(400, 'The selected member could not be identified. Refresh the page and try again.')
+    }
+
+    if (memberUserId === guild.ownerUserId) {
+      throw createHttpError(400, 'The guild owner role cannot be changed from this screen.')
+    }
+
+    const member = statements.findGuildMember.get(guild.id, memberUserId)
+    if (!member) {
+      throw createHttpError(404, 'That guild member was not found. They may have already left or been removed.')
+    }
+
+    const role = sanitizeGuildRole(request.body?.role)
+    if (role === 'owner') {
+      throw createHttpError(400, 'Transfer ownership is not supported here. Choose viewer or admin.')
+    }
+
+    statements.updateGuildMemberRole.run(role, guild.id, memberUserId)
+    writeAuditLog({
+      actorUserId: request.user.id,
+      action: 'guild.member_role_update',
+      entityType: 'guild_member',
+      entityId: `${guild.id}:${memberUserId}`,
+      details: { guildId: guild.id, memberUserId, role },
+    })
+
+    scheduleBackup('guild-member-role-update')
+    response.json({ user: serializeUser(request.user.id) })
+  } catch (error) {
+    next(error)
+  }
+})
+
 app.post('/api/guilds/:guildId/tracked-members', requireAuth, (request, response, next) => {
   try {
-    const guild = ensureGuildForUser(request.user.id, request.params.guildId)
+    const guild = ensureGuildEditor(request.user.id, request.params.guildId)
     const trackedMember = sanitizeTrackedMemberPayload(request.body)
     const trackedMemberId = crypto.randomUUID()
 
@@ -1801,7 +1882,7 @@ app.post('/api/guilds/:guildId/tracked-members', requireAuth, (request, response
 
 app.patch('/api/guilds/:guildId/tracked-members/:trackedMemberId', requireAuth, (request, response, next) => {
   try {
-    const guild = ensureGuildForUser(request.user.id, request.params.guildId)
+    const guild = ensureGuildEditor(request.user.id, request.params.guildId)
     const existingTrackedMember = statements.findTrackedMemberForGuild.get(
       request.params.trackedMemberId,
       guild.id,
@@ -1835,7 +1916,7 @@ app.patch('/api/guilds/:guildId/tracked-members/:trackedMemberId', requireAuth, 
 
 app.delete('/api/guilds/:guildId/tracked-members/:trackedMemberId', requireAuth, (request, response, next) => {
   try {
-    const guild = ensureGuildForUser(request.user.id, request.params.guildId)
+    const guild = ensureGuildEditor(request.user.id, request.params.guildId)
     const existingTrackedMember = statements.findTrackedMemberForGuild.get(
       request.params.trackedMemberId,
       guild.id,
@@ -1863,7 +1944,7 @@ app.delete('/api/guilds/:guildId/tracked-members/:trackedMemberId', requireAuth,
 
 app.post('/api/guilds/:guildId/entries', requireAuth, (request, response, next) => {
   try {
-    const guild = ensureGuildForUser(request.user.id, request.params.guildId)
+    const guild = ensureGuildEditor(request.user.id, request.params.guildId)
     const entry = sanitizeEntryPayload(request.body)
 
     const entryId = crypto.randomUUID()
@@ -1898,7 +1979,7 @@ app.post('/api/guilds/:guildId/entries', requireAuth, (request, response, next) 
 
 app.patch('/api/guilds/:guildId/entries/:entryId', requireAuth, (request, response, next) => {
   try {
-    const guild = ensureGuildForUser(request.user.id, request.params.guildId)
+    const guild = ensureGuildEditor(request.user.id, request.params.guildId)
     if (!statements.findEntryForGuild.get(request.params.entryId, guild.id)) {
       throw createHttpError(404, 'That entry could not be found. It may have already been changed or deleted.')
     }
@@ -1935,7 +2016,7 @@ app.patch('/api/guilds/:guildId/entries/:entryId', requireAuth, (request, respon
 
 app.delete('/api/guilds/:guildId/entries/:entryId', requireAuth, (request, response, next) => {
   try {
-    const guild = ensureGuildForUser(request.user.id, request.params.guildId)
+    const guild = ensureGuildEditor(request.user.id, request.params.guildId)
     if (!statements.findEntryForGuild.get(request.params.entryId, guild.id)) {
       throw createHttpError(404, 'That entry could not be found. It may have already been changed or deleted.')
     }

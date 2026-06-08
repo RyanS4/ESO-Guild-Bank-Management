@@ -5,6 +5,18 @@ import ExitToAppIcon from '@mui/icons-material/ExitToApp'
 import GroupAddIcon from '@mui/icons-material/GroupAdd'
 import HistoryEduOutlinedIcon from '@mui/icons-material/HistoryEduOutlined'
 
+const formatRoleLabel = (role) => {
+  if (role === 'owner') {
+    return 'Owner'
+  }
+
+  if (role === 'admin') {
+    return 'Admin'
+  }
+
+  return 'Viewer'
+}
+
 function GuildProfilesDrawer({
   currentUser,
   drawerContentRef,
@@ -98,30 +110,30 @@ function GuildProfilesDrawer({
               disablePadding
               secondaryAction={
                 <Stack direction="row" spacing={0.5}>
-                  {guild.isOwner && (
+                  <IconButton
+                    edge="end"
+                    onClick={() => {
+                      handleOpenAuditLog(guild)
+                      if (isMobileLayout) {
+                        setGuildDrawerOpen(false)
+                      }
+                    }}
+                  >
+                    <HistoryEduOutlinedIcon fontSize="small" />
+                  </IconButton>
+                  <IconButton
+                    edge="end"
+                    onClick={() => {
+                      handleOpenGuildAccess(guild.id)
+                      if (isMobileLayout) {
+                        setGuildDrawerOpen(false)
+                      }
+                    }}
+                  >
+                    <GroupAddIcon fontSize="small" />
+                  </IconButton>
+                  {guild.canEdit && (
                     <>
-                      <IconButton
-                        edge="end"
-                        onClick={() => {
-                          handleOpenAuditLog(guild)
-                          if (isMobileLayout) {
-                            setGuildDrawerOpen(false)
-                          }
-                        }}
-                      >
-                        <HistoryEduOutlinedIcon fontSize="small" />
-                      </IconButton>
-                      <IconButton
-                        edge="end"
-                        onClick={() => {
-                          handleOpenGuildAccess(guild.id)
-                          if (isMobileLayout) {
-                            setGuildDrawerOpen(false)
-                          }
-                        }}
-                      >
-                        <GroupAddIcon fontSize="small" />
-                      </IconButton>
                       <IconButton
                         edge="end"
                         onClick={() => {
@@ -133,6 +145,10 @@ function GuildProfilesDrawer({
                       >
                         <EditIcon fontSize="small" />
                       </IconButton>
+                    </>
+                  )}
+                  {guild.canDelete && (
+                    <>
                       <IconButton
                         edge="end"
                         onClick={() => {
@@ -165,7 +181,7 @@ function GuildProfilesDrawer({
             >
               <ListItemButton
                 selected={guild.id === currentUser.selectedGuildId}
-                sx={{ pr: guild.isOwner ? 22 : 8 }}
+                sx={{ pr: guild.canDelete ? 22 : guild.canEdit || guild.canManagePermissions ? 18 : 8 }}
                 onClick={() => {
                   handleSelectGuild(guild.id)
                   if (isMobileLayout) {
@@ -175,7 +191,7 @@ function GuildProfilesDrawer({
               >
                 <ListItemText
                   primary={guild.name}
-                  secondary={`${guild.entries.length} entries${guild.isOwner ? ' • Owner' : ` • Shared by ${guild.ownerUsername}`}`}
+                  secondary={`${guild.entries.length} entries • ${formatRoleLabel(guild.role)}${guild.isOwner ? '' : ` • Shared by ${guild.ownerUsername}`}`}
                 />
               </ListItemButton>
             </ListItem>
